@@ -44,6 +44,7 @@ export type {
 export type {
   MdastNode,
   HastNode,
+  Custom,
   DataMap,
   Data,
   SourceFormat,
@@ -73,6 +74,7 @@ export type {
   MdastPluginInstance,
   MdastVisitorContext,
   MdastContent,
+  MdastTarget,
 } from "./mdast/mdast-visitor.js";
 export {
   visitHastHandle,

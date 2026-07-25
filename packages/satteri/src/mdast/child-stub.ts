@@ -31,10 +31,18 @@ const HAND_WRITTEN_FIELDS: Readonly<Record<number, readonly string[]>> = {
 
 const TYPE_NAME_BY_TAG = flatByTag(TYPE_NAMES);
 
+/** Internal tag for user-defined nodes; its stored `name` field is folded into
+ *  the open `node.type`, so the stub exposes `value` (leaf content) but no
+ *  separate `name`. */
+const MDAST_CUSTOM = NAME_TO_TYPE.custom!;
+
 const MDAST_STUB_DESCRIPTORS: (readonly StubDescriptorEntry[] | undefined)[] = [];
 for (const tag of Object.keys(TYPE_NAMES)) {
   const nodeType = Number(tag);
-  const fields = [...(MDAST_LAYOUT_KEYS[nodeType] ?? HAND_WRITTEN_FIELDS[nodeType] ?? [])];
+  const fields =
+    nodeType === MDAST_CUSTOM
+      ? ["value"]
+      : [...(MDAST_LAYOUT_KEYS[nodeType] ?? HAND_WRITTEN_FIELDS[nodeType] ?? [])];
   if (!LEAF_TYPES.has(nodeType)) fields.push("children");
   MDAST_STUB_DESCRIPTORS[nodeType] = stubDescriptors(fields);
 }
@@ -47,16 +55,43 @@ const FALLBACK_DESCRIPTORS = stubDescriptors([]);
  * forward to the materialized node (first read snapshots the arena via
  * `materializeOne`, which enforces the handle epoch). Spread/identity rules
  * are enforced by `nid()` (authoritative doc in hast-visitor.ts).
+ *
+ * A user-defined node's `type` is the one exception: it lives in the arena,
+ * not the tag, so it joins the lazy fields rather than making every sibling
+ * list snapshot the arena up front.
  */
 export class MdastChildStub {
   _resolver: MdastResolver;
   _id: number;
-  type: string;
+  type!: string;
 
   constructor(resolver: MdastResolver, id: number, nodeType: number) {
     this._resolver = resolver;
     this._id = id;
-    this.type = TYPE_NAME_BY_TAG[nodeType] ?? `unknown(${nodeType})`;
+    if (nodeType === MDAST_CUSTOM) {
+      installLazyCustomType(this);
+    } else {
+      this.type = TYPE_NAME_BY_TAG[nodeType] ?? `unknown(${nodeType})`;
+    }
     installStubDescriptors(this, MDAST_STUB_DESCRIPTORS[nodeType] ?? FALLBACK_DESCRIPTORS);
   }
+}
+
+/** `type` as a self-replacing accessor: the materialized node folds the stored
+ *  name into `type`. Enumerable so a spread copy still carries it. */
+function installLazyCustomType(stub: MdastChildStub): void {
+  Object.defineProperty(stub, "type", {
+    get(this: MdastChildStub): string {
+      const value = (this._resolver.materializeOne(this._id) as { type: string }).type;
+      Object.defineProperty(this, "type", {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      return value;
+    },
+    enumerable: true,
+    configurable: true,
+  });
 }

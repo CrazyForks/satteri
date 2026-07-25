@@ -610,6 +610,15 @@ pub const MDAST_NODES: &[Node] = &[
         "descriptionDetails",
         DESCRIPTION_DETAILS_SLOTS,
     ),
+    // User-defined node. One internal tag keeps the tag space closed; the
+    // author's open `type` string lives in `name` and is surfaced as `node.type`.
+    n(
+        Mdast,
+        38,
+        "Custom",
+        "custom",
+        &[s16("name", 0), s32("value", 8)],
+    ),
     xts(
         Mdast,
         100,
@@ -782,6 +791,11 @@ pub const MDAST_STRUCTS: &[ArenaStruct] = &[
         offsets: &[("meta", 0), ("value", 8)],
     },
     ArenaStruct {
+        rust: "CustomData",
+        size: 16,
+        offsets: &[("name", 0), ("value", 8)],
+    },
+    ArenaStruct {
         rust: "LinkData",
         size: 16,
         offsets: &[("url", 0), ("title", 8)],
@@ -850,6 +864,7 @@ const STRUCT_BY_NODE: &[(&str, &str)] = &[
     ("code", "CodeData"),
     ("math", "MathData"),
     ("inlineMath", "MathData"),
+    ("custom", "CustomData"),
     ("link", "LinkData"),
     ("image", "ImageData"),
     ("definition", "DefinitionData"),

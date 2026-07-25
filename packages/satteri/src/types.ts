@@ -1,5 +1,6 @@
 import type { Position } from "unist";
 import type {
+  Data as MdastData,
   Literal as MdastLiteral,
   Nodes as MdastStdNodes,
   Parent as MdastParent,
@@ -80,6 +81,27 @@ export interface DescriptionDetails extends MdastParent {
   children: BlockContent[];
   /** Loose definitions wrap their content in a `<p>`; tight ones don't. */
   spread?: boolean;
+}
+
+/**
+ * A user-defined mdast node. `type` is an arbitrary string the plugin chooses
+ * (e.g. `"section"`); it round-trips and is surfaced back as `node.type`. Pass
+ * one to `ctx.replaceNode` / `insertBefore` / `appendChild`, etc.
+ *
+ * Works as either shape:
+ * - a **parent** with `children` renders to an element through `data.hName`
+ *   (default `<div>`), merges `data.hProperties`, and renders its children;
+ * - a **leaf** with a non-empty `value` (and no `children` or `data.h*`)
+ *   renders to an HTML text node.
+ *
+ * Only these fields survive the round trip; put anything else in `data`.
+ */
+export interface Custom {
+  type: string;
+  children?: (MdastNode | Custom)[];
+  value?: string;
+  data?: MdastData;
+  position?: Position;
 }
 
 declare module "mdast" {
