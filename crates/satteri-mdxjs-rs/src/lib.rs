@@ -151,14 +151,19 @@ pub fn compile_with_convert_options(
     if let Some((offset, msg)) = mdx_errors.first() {
         return Err(parse_error_to_message(value, *offset, msg));
     }
-    let hast_arena =
+    let mut hast_arena =
         satteri_ast::hast::mdast_arena_to_hast_arena_with_options(&arena, convert_options);
+    // The conversion doesn't carry the flag over.
+    hast_arena.mdx = parse_options.contains(satteri_pulldown_cmark::Options::ENABLE_MDX);
     compile_hast_arena(&hast_arena, options)
 }
 
 /// Compile a HAST arena directly to JavaScript.
 ///
 /// The arena can be mutated before calling (e.g. `simplify_plain_mdx_nodes`).
+///
+/// Callers must set `arena.mdx` to match the source they parsed: MDX arenas
+/// error on raw HTML, plain Markdown ones drop it.
 ///
 /// # Errors
 ///
@@ -192,7 +197,33 @@ pub fn compile_hast_arena(
     if options.output_format == OutputFormat::FunctionBody {
         transform_program_to_function_body(&mut program, &allocator);
     }
-    Ok(serialize(&program.program))
+    let mut code = jsx_pragma_comments(options);
+    code.push_str(&serialize(&program.program));
+    Ok(code)
+}
+
+/// Only emitted with `jsx`: a downstream transform reads these to resolve the
+/// runtime, which is already resolved once the JSX is compiled away here.
+fn jsx_pragma_comments(options: &Options) -> String {
+    if !options.jsx {
+        return String::new();
+    }
+    let mut out = String::new();
+    match options.jsx_runtime.unwrap_or_default() {
+        JsxRuntime::Automatic => {
+            out.push_str("/*@jsxRuntime automatic*/\n/*@jsxImportSource ");
+            out.push_str(options.jsx_import_source.as_deref().unwrap_or("react"));
+            out.push_str("*/\n");
+        }
+        JsxRuntime::Classic => {
+            out.push_str("/*@jsxRuntime classic*/\n/*@jsx ");
+            out.push_str(options.pragma.as_deref().unwrap_or("React.createElement"));
+            out.push_str("*/\n/*@jsxFrag ");
+            out.push_str(options.pragma_frag.as_deref().unwrap_or("React.Fragment"));
+            out.push_str("*/\n");
+        }
+    }
+    out
 }
 
 fn transform_program_to_function_body<'a>(program: &mut MdxProgram<'a>, allocator: &'a Allocator) {

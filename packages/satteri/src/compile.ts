@@ -35,6 +35,7 @@ import {
   createMdxHastHandleWithFrontmatter,
   getMdastFrontmatter,
   markdownToHtmlFast,
+  markdownToJsFast,
   mdxToJsFast,
   renderHandle,
   serializeHandle,
@@ -482,12 +483,9 @@ export interface CompileOptions {
 }
 
 /**
- * MDX-only compile options.
- *
- * These are the fields specific to MDX compilation, separate from the shared
- * pipeline options in {@link CompileOptions}. Useful for wrappers (Vite/Rollup
- * plugins, framework integrations) that want to expose MDX-specific knobs
- * without re-exposing the shared pipeline fields.
+ * JS/JSX output options, accepted by both {@link mdxToJs} and
+ * {@link markdownToJs}. Exported on its own so wrappers can expose the codegen
+ * knobs without the shared pipeline fields.
  */
 export interface MdxOnlyOptions {
   optimizeStatic?: OptimizeStaticConfig;
@@ -538,6 +536,8 @@ export interface MdxOnlyOptions {
 
 export interface MdxCompileOptions extends CompileOptions, MdxOnlyOptions {}
 
+export interface MarkdownToJsOptions extends CompileOptions, MdxOnlyOptions {}
+
 /** Frontmatter block extracted from the parsed Markdown/MDX source. */
 export interface Frontmatter {
   /** Delimiter syntax used for the block. */
@@ -566,8 +566,18 @@ export interface MdxToJsResult {
   data: Data;
 }
 
+/** Result of {@link markdownToJs}. */
+export interface MarkdownToJsResult {
+  /** Compiled JavaScript module source. */
+  code: string;
+  /** Frontmatter block at the start of the document, or `null` if none. */
+  frontmatter: Frontmatter | null;
+  /** Document-level data bag shared with plugins via `ctx.data`; the seeded `data` option if provided, else a fresh `{}`. */
+  data: Data;
+}
+
 // Type helpers: detect whether any visitor in any plugin returns a Promise.
-// Used to narrow `markdownToHtml`/`mdxToJs` to a sync return when every plugin
+// Used to narrow the compile entry points to a sync return when every plugin
 // is sync, while keeping the union when at least one visitor is async.
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -766,6 +776,32 @@ export function mdxToJs(
   source: string,
   options: MdxCompileOptions = {},
 ): MdxToJsResult | Promise<MdxToJsResult> {
+  return toJsImpl(source, options, true);
+}
+
+/**
+ * Compile plain Markdown to a JavaScript module: like {@link mdxToJs}, but
+ * without MDX syntax — `{...}` expressions, JSX tags, and `import`/`export`
+ * lines are ordinary Markdown. HTML has no JSX representation and is dropped;
+ * enable `features: { rawHtml: true }` to parse it into real elements instead.
+ */
+export function markdownToJs<O extends MarkdownToJsOptions>(
+  source: string,
+  options?: O,
+): ResultFor<O, MarkdownToJsResult>;
+export function markdownToJs(
+  source: string,
+  options: MarkdownToJsOptions = {},
+): MarkdownToJsResult | Promise<MarkdownToJsResult> {
+  return toJsImpl(source, options, false);
+}
+
+/** `mdx` picks the parser; the pipeline is identical from MDAST on. */
+function toJsImpl(
+  source: string,
+  options: MdxCompileOptions,
+  mdx: boolean,
+): MdxToJsResult | Promise<MdxToJsResult> {
   const {
     mdastPlugins: mdastInput = [],
     hastPlugins: hastInput = [],
@@ -785,7 +821,7 @@ export function mdxToJs(
   // frontmatter extraction all happen inside a single NAPI call. Skips 5 of
   // the 6 handle-based crossings the plugin-capable path needs.
   if (mdastPlugins.length === 0 && hastPlugins.length === 0) {
-    const { code, frontmatter } = mdxToJsFast(
+    const { code, frontmatter } = (mdx ? mdxToJsFast : markdownToJsFast)(
       source,
       nativeFeatures,
       mdxOptions,
@@ -805,14 +841,16 @@ export function mdxToJs(
   // MDAST-plugins-only fused tail (no HAST plugins): apply + extract
   // frontmatter + convert + simplify + compile happen in one NAPI call.
   if (hastPlugins.length === 0) {
-    const mdastHandle = createMdxMdastHandle(source, nativeFeatures, trackPositions);
+    const mdastHandle = mdx
+      ? createMdxMdastHandle(source, nativeFeatures, trackPositions)
+      : createMdastHandle(source, nativeFeatures, trackPositions);
     try {
       const mdastResult = runMdastPluginsOnHandle(
         mdastHandle,
         mdastPlugins,
         fileURL,
         data,
-        "mdx",
+        mdx ? "mdx" : "markdown",
         true,
       );
       const finishMdast = (r: MdastPipelineResult): MdxToJsResult => {
@@ -851,7 +889,7 @@ export function mdxToJs(
   const result = createHastHandleFromMdast(
     source,
     mdastPlugins,
-    true,
+    mdx,
     fileURL,
     nativeFeatures,
     nativeConvertOptions,
@@ -868,7 +906,7 @@ export function mdxToJs(
         source,
         fileURL,
         data,
-        "mdx",
+        mdx ? "mdx" : "markdown",
       );
     } catch (err) {
       releaseHandle(r.hastHandle, hastMayHaveStubs);

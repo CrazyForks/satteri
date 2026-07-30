@@ -323,10 +323,16 @@ fn one<'a>(
         Some(HastNodeType::Root) => transform_root(context, node_id, explicit_jsxs),
         Some(HastNodeType::Element) => transform_element(context, node_id, explicit_jsxs),
         Some(HastNodeType::Text) => Ok(transform_text(context, node_id)),
-        // `raw` is opaque HTML with no JSX representation, so error rather than
-        // silently escape it as text. (`optimize_static` collapses raw into an
-        // HTML injection upstream, so this arm only fires on the plain path.)
-        Some(HastNodeType::Raw) => Err(raw_html_in_mdx_error(context, node_id)),
+        // No JSX representation. Under MDX a `raw` node can only come from a
+        // plugin, so it errors there. `optimize_static` collapses raw into
+        // injected HTML earlier, so this arm only fires without it.
+        Some(HastNodeType::Raw) => {
+            if context.view.mdx {
+                Err(raw_html_in_mdx_error(context, node_id))
+            } else {
+                Ok(None)
+            }
+        }
         Some(HastNodeType::Comment) => Ok(Some(transform_comment(context, node_id))),
         Some(HastNodeType::MdxJsxElement | HastNodeType::MdxJsxTextElement) => {
             transform_mdx_jsx_element(context, node_id, explicit_jsxs)
@@ -345,8 +351,8 @@ fn raw_html_in_mdx_error(context: &Context<'_>, node_id: u32) -> message::Messag
             A plugin returned an `html` node (`{ type: \"html\", value: ... }`), \
             which cannot be represented as JSX. Return \
             `{ raw: ..., mdxExpressions: false }` instead so the HTML is parsed \
-            into elements, or use the markdown (non-MDX) output where raw HTML is \
-            emitted verbatim."
+            into JSX, or enable `features: { rawHtml: true }` to parse it into \
+            elements."
             .into(),
         place: crate::oxc_utils::u32_to_point(
             node_span(context.view, node_id).start,
@@ -652,8 +658,18 @@ fn transform_element<'a>(
         )));
     }
 
+    // The span feeds development `__source`. `explicit_jsxs` is keyed by span,
+    // so an MDX descendant covering the identical range would make this element
+    // read as author-written JSX; children are already transformed by here.
+    let span = node_span(context.view, node_id);
+    let span = if explicit_jsxs.contains(&span) {
+        SPAN
+    } else {
+        span
+    };
+
     Ok(Some(JSXChild::Element(OxcBox::new_in(
-        create_element(alloc, tag_name, attrs, children, SPAN),
+        create_element(alloc, tag_name, attrs, children, span),
         alloc,
     ))))
 }
@@ -935,7 +951,7 @@ fn transform_root<'a>(
     let nodes = OxcVec::from_iter_in(nodes, alloc);
 
     Ok(Some(JSXChild::Fragment(OxcBox::new_in(
-        create_fragment(alloc, nodes, SPAN),
+        create_fragment(alloc, nodes, node_span(context.view, node_id)),
         alloc,
     ))))
 }

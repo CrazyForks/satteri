@@ -1,14 +1,18 @@
-import { evaluate as mdxEvaluate } from "@mdx-js/mdx";
-import type { EvaluateOptions as MdxEvaluateOptions } from "@mdx-js/mdx";
+import { compile as mdxCompile, evaluate as mdxEvaluate } from "@mdx-js/mdx";
+import type {
+  CompileOptions as MdxCompileOptions,
+  EvaluateOptions as MdxEvaluateOptions,
+} from "@mdx-js/mdx";
 import {
   evaluate as satteriEvaluate,
   defineHastPlugin,
+  markdownToJs,
   markdownToMdast,
   markdownToHast,
   markdownToHtml,
   mdxToJs,
 } from "../../src/index.js";
-import type { Features, EvaluateOptions } from "../../src/index.js";
+import type { Features, EvaluateOptions, MarkdownToJsOptions, HastNode } from "../../src/index.js";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
 import * as runtime from "react/jsx-runtime";
@@ -20,6 +24,7 @@ import remarkFrontmatter from "remark-frontmatter";
 import remarkDirective from "remark-directive";
 
 import remarkRehype from "remark-rehype";
+import rehypeRaw from "rehype-raw";
 import rehypeStringify from "rehype-stringify";
 import type { Nodes } from "hast";
 import { expect } from "vitest";
@@ -448,6 +453,9 @@ export function satteriHtml(md: string): string {
   return normalizeHtmlForComparison(html);
 }
 
+// Collapsing whitespace around tags also hides whitespace-only text nodes next
+// to an element, such as a table's row newlines: JSX strips those, satteri keeps
+// them.
 function normalizeHtml(html: string): string {
   return html.replace(/>\s+</g, "><").replace(/\s+</g, "<").replace(/>\s+/g, ">").trim();
 }
@@ -471,6 +479,196 @@ export async function assertMdxConformance(
   );
 
   expect(normalizeHtml(satHtml)).toBe(normalizeHtml(mdxHtml));
+}
+
+// Reference is @mdx-js/mdx with `format: "md"`. Both sides evaluate to a
+// component and render through react-dom/server, so escaping is identical and
+// only structural differences survive.
+export interface MarkdownJsConformanceOptions {
+  components?: Record<string, unknown>;
+  rawHtml?: boolean;
+  frontmatter?: boolean;
+  math?: boolean;
+  /** Pins when raw HTML is dropped: only what the plugins leave behind goes. */
+  rewriteRaw?: boolean;
+}
+
+/** Makes a `raw` node show up in the render instead of being dropped. */
+const rewriteRawToCode = {
+  reference: () => (tree: Nodes) => {
+    const walk = (node: Nodes): void => {
+      if (!("children" in node)) return;
+      node.children = node.children.map((child) => {
+        walk(child as Nodes);
+        return child.type === "raw"
+          ? ({
+              type: "element",
+              tagName: "code",
+              properties: {},
+              children: [{ type: "text", value: child.value }],
+            } as Nodes)
+          : child;
+      }) as typeof node.children;
+    };
+    walk(tree);
+  },
+  satteri: defineHastPlugin({
+    name: "rewrite-raw-to-code",
+    raw(node) {
+      return {
+        type: "element",
+        tagName: "code",
+        properties: {},
+        children: [{ type: "text", value: node.value }],
+      } as HastNode;
+    },
+  }),
+};
+
+export async function assertMarkdownJsConformance(
+  input: string,
+  options: MarkdownJsConformanceOptions = {},
+): Promise<void> {
+  const {
+    components = {},
+    rawHtml = false,
+    frontmatter = false,
+    math = false,
+    rewriteRaw = false,
+  } = options;
+
+  const remarkPlugins: unknown[] = [remarkGfm];
+  if (frontmatter) remarkPlugins.push([remarkFrontmatter, ["yaml", "toml"]]);
+  if (math) remarkPlugins.push(remarkMath);
+  const rehypePlugins: unknown[] = [];
+  if (rawHtml) rehypePlugins.push(rehypeRaw);
+  if (rewriteRaw) rehypePlugins.push(rewriteRawToCode.reference);
+  const { default: MdxComponent } = (await mdxEvaluate(input, {
+    ...mdxRuntime,
+    format: "md",
+    remarkPlugins: remarkPlugins as MdxEvaluateOptions["remarkPlugins"],
+    rehypePlugins: rehypePlugins as MdxEvaluateOptions["rehypePlugins"],
+  })) as { default: Function };
+  const mdxHtml = renderToStaticMarkup(
+    createElement(MdxComponent as React.FC<Record<string, unknown>>, { components }),
+  );
+
+  const { code } = markdownToJs(input, {
+    outputFormat: "function-body",
+    features: { frontmatter, math, rawHtml },
+    hastPlugins: rewriteRaw ? [rewriteRawToCode.satteri] : [],
+  });
+  const { default: SatComponent } = new Function(code)(satteriRuntime) as { default: Function };
+  const satHtml = renderToStaticMarkup(
+    createElement(SatComponent as React.FC<Record<string, unknown>>, { components }),
+  );
+
+  expect(normalizeHtml(satHtml)).toBe(normalizeHtml(mdxHtml));
+}
+
+interface ModuleEnvelope {
+  pragmas: string[];
+  imports: string[];
+  defaultExport: string | null;
+  markers: string[];
+}
+
+// Presence-only, not a text comparison: satteri emits `Object.assign` where
+// @mdx-js/mdx spreads, and pretty-prints differently.
+const ENVELOPE_MARKERS = [
+  "_createMdxContent",
+  "MDXContent",
+  "MDXLayout",
+  "_provideComponents",
+  "_missingMdxReference",
+  "props.components",
+  "_Fragment",
+  "_jsx",
+  "_jsxs",
+  "_jsxDEV",
+  "React.createElement",
+];
+
+function moduleEnvelope(code: string): ModuleEnvelope {
+  const imports: string[] = [];
+  const importRe = /import\s+(?:([\w$]+)\s*,?\s*)?(?:\{([^}]*)\})?\s*from\s*"([^"]+)"/g;
+  for (const match of code.matchAll(importRe)) {
+    const names: string[] = [];
+    if (match[1]) names.push(`default as ${match[1]}`);
+    if (match[2])
+      names.push(
+        ...match[2]
+          .split(",")
+          .map((name) => name.trim().replace(/\s+/g, " "))
+          .filter(Boolean),
+      );
+    imports.push(`${match[3]}: ${names.sort().join(", ")}`);
+  }
+  const defaultExport = /export default (?:function\s+)?([\w$]+)/.exec(code);
+  return {
+    pragmas: [...code.matchAll(/\/\*(@jsx[A-Za-z]*\s[^*]*)\*\//g)].map((match) => match[1]!.trim()),
+    imports: imports.sort(),
+    defaultExport: defaultExport ? defaultExport[1]! : null,
+    markers: ENVELOPE_MARKERS.filter((marker) =>
+      new RegExp(`${marker.replaceAll(".", "\\.")}\\b`).test(code),
+    ),
+  };
+}
+
+/**
+ * Compare the compiled module's envelope against @mdx-js/mdx `format: "md"`.
+ * Covers the options that shape the module rather than the rendered tree, which
+ * the evaluate-and-render comparison cannot see.
+ */
+export async function assertMarkdownJsModuleConformance(
+  input: string,
+  options: MarkdownToJsOptions & { frontmatter?: boolean } = {},
+): Promise<void> {
+  const { frontmatter = false, features, ...jsOptions } = options;
+  const remarkPlugins: unknown[] = [remarkGfm];
+  if (frontmatter) remarkPlugins.push([remarkFrontmatter, ["yaml", "toml"]]);
+
+  const expected = moduleEnvelope(
+    String(
+      await mdxCompile(input, {
+        format: "md",
+        remarkPlugins: remarkPlugins as MdxCompileOptions["remarkPlugins"],
+        ...(jsOptions as MdxCompileOptions),
+      }),
+    ),
+  );
+  const { code } = markdownToJs(input, {
+    ...jsOptions,
+    features: { frontmatter, math: false, ...features },
+  });
+  expect(moduleEnvelope(code)).toEqual(expected);
+}
+
+/**
+ * Compare the `__source` metadata against @mdx-js/mdx `format: "md"`: one
+ * `line:column` per JSX call, in source order.
+ */
+export async function assertMarkdownJsDevPositionConformance(input: string): Promise<void> {
+  const positions = (code: string): string[] =>
+    [...code.matchAll(/lineNumber: (\d+),\s*columnNumber: (\d+)/g)].map(
+      (match) => `${match[1]}:${match[2]}`,
+    );
+
+  const expected = positions(
+    String(
+      await mdxCompile(input, {
+        format: "md",
+        development: true,
+        remarkPlugins: [remarkGfm] as MdxCompileOptions["remarkPlugins"],
+      }),
+    ),
+  );
+  const { code } = markdownToJs(input, {
+    development: true,
+    features: { frontmatter: false, math: false },
+  });
+  expect(expected.length).toBeGreaterThan(0);
+  expect(positions(code)).toEqual(expected);
 }
 
 // Like `assertMdxConformance`, but with math enabled on both pipelines

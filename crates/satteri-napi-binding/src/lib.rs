@@ -929,6 +929,7 @@ pub fn apply_mdast_commands_and_convert_and_compile(
         &convert_opts,
         acquire_hast_arena(),
     );
+    hast_arena.mdx = mdx;
     release_mdast_arena(mutated);
     let mdx_opts = js_options_to_rust(options);
     let ignore = mdx_opts
@@ -1213,37 +1214,37 @@ pub struct MdxJsOneShot {
     pub dropped_transforms: u32,
 }
 
-/// Fast path: parse MDX → MDAST → HAST → JS, plus extract frontmatter, in a
-/// single NAPI roundtrip. Used by `mdxToJs` when the caller didn't configure
-/// any plugins. Skips 5 of the 6 NAPI crossings the handle-based path makes.
+/// Shared body of the `*ToJsFast` exports. `mdx` picks the parser; plain parses
+/// never produce MDX errors, so the check below is a no-op for them.
 #[cfg(feature = "mdx")]
-#[napi]
-pub fn mdx_to_js_fast(
+fn to_js_fast_impl(
     env: Env,
-    source: String,
+    source: &str,
     features: Option<JsFeatures>,
     options: Option<JsMdxOptions>,
     convert_options: Option<JsConvertOptions>,
+    mdx: bool,
 ) -> Result<MdxJsOneShot> {
-    let opts = features_to_options(features, true);
+    let opts = features_to_options(features, mdx);
     let convert_opts = js_convert_options_to_rust(env, convert_options);
     // Skip the LineIndex + per-node line/col work; byte offsets still flow to
     // the HAST arena, so codegen resolves dev `__source` / error line:col via
     // `Location`.
     let mdast_reuse = acquire_mdast_arena();
     let (mdast, mdx_errors) =
-        satteri_pulldown_cmark::parse_no_positions_into(&source, opts, mdast_reuse);
+        satteri_pulldown_cmark::parse_no_positions_into(source, opts, mdast_reuse);
     if let Some((offset, msg)) = mdx_errors.first() {
         // Best-effort: drop the arena rather than poisoning the pool with a
         // half-built error state.
         return Err(napi::Error::from_reason(
-            satteri_mdxjs::parse_error_to_message(&source, *offset, msg).to_string(),
+            satteri_mdxjs::parse_error_to_message(source, *offset, msg).to_string(),
         ));
     }
     let frontmatter = extract_mdast_frontmatter(&mdast);
     let hast_reuse = acquire_hast_arena();
     let mut hast =
         satteri_ast::hast::mdast_arena_to_hast_arena_into(&mdast, &convert_opts, hast_reuse);
+    hast.mdx = mdx;
     let mdx_opts = js_options_to_rust(options);
 
     let ignore = mdx_opts
@@ -1262,6 +1263,35 @@ pub fn mdx_to_js_fast(
         frontmatter,
         dropped_transforms: 0,
     })
+}
+
+/// Fast path: parse MDX → MDAST → HAST → JS, plus extract frontmatter, in a
+/// single NAPI roundtrip. Used by `mdxToJs` when the caller didn't configure
+/// any plugins. Skips 5 of the 6 NAPI crossings the handle-based path makes.
+#[cfg(feature = "mdx")]
+#[napi]
+pub fn mdx_to_js_fast(
+    env: Env,
+    source: String,
+    features: Option<JsFeatures>,
+    options: Option<JsMdxOptions>,
+    convert_options: Option<JsConvertOptions>,
+) -> Result<MdxJsOneShot> {
+    to_js_fast_impl(env, &source, features, options, convert_options, true)
+}
+
+/// Plain-Markdown variant of [`mdx_to_js_fast`]: MDX syntax stays literal text.
+/// Used by `markdownToJs` when the caller didn't configure any plugins.
+#[cfg(feature = "mdx")]
+#[napi]
+pub fn markdown_to_js_fast(
+    env: Env,
+    source: String,
+    features: Option<JsFeatures>,
+    options: Option<JsMdxOptions>,
+    convert_options: Option<JsConvertOptions>,
+) -> Result<MdxJsOneShot> {
+    to_js_fast_impl(env, &source, features, options, convert_options, false)
 }
 
 /// Compile a HAST handle's arena to MDX JavaScript. Does not consume the handle.

@@ -5,7 +5,7 @@ section: "reference"
 order: 4
 ---
 
-Options for Sätteri's [entry points](/docs/entry-points/). `CompileOptions` is shared by `markdownToHtml` and `mdxToJs`, which additionally accepts the [MDX options](#mdx-options) below.
+Options for Sätteri's [entry points](/docs/entry-points/). `CompileOptions` is shared by `markdownToHtml`, `mdxToJs`, and `markdownToJs`; the last two additionally accept the [MDX options](#mdx-options) below.
 
 ## CompileOptions
 
@@ -44,7 +44,7 @@ It is used by reference and mutated in place, so pass a throwaway object per com
 
 ## MDX options
 
-`mdxToJs` accepts everything in `CompileOptions` plus the MDX-only fields below (also exported on their own as `MdxOnlyOptions`).
+`mdxToJs` accepts everything in `CompileOptions` plus the MDX-only fields below (also exported on their own as `MdxOnlyOptions`). They all concern the compiled JS/JSX output, so `markdownToJs` accepts them too.
 
 ### optimizeStatic
 
@@ -90,3 +90,5 @@ The remaining MDX options control the generated JavaScript and are named after t
 | `outputFormat`             | `"program" \| "function-body"` | `"program"`             | `program` emits an ES module; `function-body` emits a body for `new Function()` / `evaluate`. |
 | `elementAttributeNameCase` | `"react" \| "html"`            | `"react"`               | Casing for attributes on rehype-produced elements.                                            |
 | `stylePropertyNameCase`    | `"dom" \| "css"`               | `"dom"`                 | Casing for keys in parsed `style` objects.                                                    |
+
+With `jsx: true` the output opens with `/*@jsxRuntime …*/` pragma comments, so whichever transform compiles the JSX later picks up the runtime settings above.
