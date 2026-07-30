@@ -56,6 +56,12 @@ pub enum CommandError {
     /// A structurally valid but re-entrant patch shape (e.g. a payload ref
     /// naming its own anchor's ancestor) that in-place application rejects.
     UnsupportedPatchShape(&'static str),
+    /// A `wrapNode` `{rawHtml}` payload with no usable wrapper; the string
+    /// says why.
+    InvalidWrapHtml(String),
+    /// A void element (the tag) as the wrapper would render without children,
+    /// dropping the wrapped node.
+    VoidWrapParent(String),
 }
 
 impl std::fmt::Display for CommandError {
@@ -117,6 +123,13 @@ impl std::fmt::Display for CommandError {
             Self::PatchOnRemovedSubtree(id) => {
                 write!(f, "patch targets node {id} inside a removed subtree")
             }
+            Self::InvalidWrapHtml(reason) => {
+                write!(f, "wrapNode: {{rawHtml}} wrapper {reason}")
+            }
+            Self::VoidWrapParent(tag) => write!(
+                f,
+                "wrapNode: <{tag}> is a void element, which cannot hold the wrapped node"
+            ),
         }
     }
 }

@@ -22,7 +22,8 @@
 
 use satteri_arena::{Arena, ArenaBuilder, ArenaKind, Hast, Mdast, StringRef};
 use satteri_ast::commands::CommandError;
-use satteri_ast::hast::HastNodeType;
+use satteri_ast::hast::codec::decode_element_tag;
+use satteri_ast::hast::{is_void_element, HastNodeType};
 use satteri_ast::mdast::codec::*;
 use satteri_ast::mdast::MdastNodeType;
 use satteri_ast::patch::{Patch, PatchContent, REF_NODE_TYPE};
@@ -1076,28 +1077,74 @@ fn replay_hast_opstream(
     replay_opstream::<HastFieldCollector>(ops, builder, original_len, anchor)
 }
 
-/// Returns (arena, keep_children) for a HAST sub-tree payload. Only
-/// `PAYLOAD_OPSTREAM` (declarative-compiled) is accepted — HAST has no source
-/// grammar, so raw markdown / HTML are not, and there is no JSON path.
+/// Returns (arena, keep_children) for a HAST sub-tree payload: an op-stream,
+/// or — wrap only — `PAYLOAD_RAW` parsed as an HTML fragment. Other ops don't
+/// need raw: the `raw` node type covers opaque HTML.
 fn read_hast_payload(
     reader: &mut BufReader<'_>,
     builder: &mut ArenaBuilder<Hast>,
     original_len: u32,
     anchor: u32,
+    for_wrap: bool,
 ) -> Result<(PatchContent<Hast>, bool), CommandError> {
     let payload_type = reader.read_u8()?;
-    let len = reader.read_u32()? as usize;
 
     match payload_type {
         PAYLOAD_OPSTREAM => {
+            let len = reader.read_u32()? as usize;
             let ops = reader.read_bytes(len)?;
             Ok((
                 PatchContent::Grafted(replay_hast_opstream(ops, builder, original_len, anchor)?),
                 false,
             ))
         }
+        PAYLOAD_RAW if for_wrap => {
+            // Flags (RAW_LITERAL_BRACES) are an MDX concern; HTML parsing has
+            // no expressions to escape.
+            let _flags = reader.read_u8()?;
+            let len = reader.read_u32()? as usize;
+            let raw = reader.read_str(len)?;
+            Ok((PatchContent::Tree(hast_wrap_arena_from_html(raw)?), false))
+        }
         other => Err(CommandError::UnknownPayloadType(other)),
     }
+}
+
+#[cfg(feature = "from-html")]
+fn hast_wrap_arena_from_html(raw: &str) -> Result<Arena<Hast>, CommandError> {
+    satteri_ast::hast::html_fragment_to_wrap_arena(raw).map_err(CommandError::InvalidWrapHtml)
+}
+
+/// Erroring beats silently mis-wrapping when the parser was compiled out.
+#[cfg(not(feature = "from-html"))]
+fn hast_wrap_arena_from_html(_raw: &str) -> Result<Arena<Hast>, CommandError> {
+    Err(CommandError::InvalidWrapHtml(
+        "requires HTML parsing, which this build omits (from-html feature)".to_string(),
+    ))
+}
+
+/// A void wrapper would drop the wrapped node at render. `{rawHtml}` payloads
+/// are rejected at parse time; this covers op-stream element payloads.
+fn reject_void_wrap_parent(
+    parent_tree: &PatchContent<Hast>,
+    grafted: &Arena<Hast>,
+) -> Result<(), CommandError> {
+    let (source, wrapper) = match parent_tree {
+        PatchContent::Tree(tree) if !tree.is_empty() => (tree, 0),
+        PatchContent::Grafted(roots) => match roots.first() {
+            Some(&root) => (grafted, root),
+            None => return Ok(()),
+        },
+        PatchContent::Tree(_) => return Ok(()),
+    };
+    if source.get_node(wrapper).node_type != HastNodeType::Element as u8 {
+        return Ok(());
+    }
+    let tag = source.get_str(decode_element_tag(source.get_type_data(wrapper)));
+    if is_void_element(tag) {
+        return Err(CommandError::VoidWrapParent(tag.to_string()));
+    }
+    Ok(())
 }
 
 /// Apply a command buffer to an MDAST arena. Set-property mutations are
@@ -1400,21 +1447,21 @@ pub fn apply_hast_commands_lenient(
             CMD_INSERT_BEFORE => {
                 let node_id = reader.read_anchor(original_len)?;
                 let (new_tree, _) =
-                    read_hast_payload(&mut reader, &mut builder, original_len, node_id)?;
+                    read_hast_payload(&mut reader, &mut builder, original_len, node_id, false)?;
                 patches.push(Patch::InsertBefore { node_id, new_tree });
             }
 
             CMD_INSERT_AFTER => {
                 let node_id = reader.read_anchor(original_len)?;
                 let (new_tree, _) =
-                    read_hast_payload(&mut reader, &mut builder, original_len, node_id)?;
+                    read_hast_payload(&mut reader, &mut builder, original_len, node_id, false)?;
                 patches.push(Patch::InsertAfter { node_id, new_tree });
             }
 
             CMD_PREPEND_CHILD => {
                 let node_id = reader.read_anchor(original_len)?;
                 let (child_tree, _) =
-                    read_hast_payload(&mut reader, &mut builder, original_len, node_id)?;
+                    read_hast_payload(&mut reader, &mut builder, original_len, node_id, false)?;
                 patches.push(Patch::PrependChild {
                     node_id,
                     child_tree,
@@ -1424,7 +1471,7 @@ pub fn apply_hast_commands_lenient(
             CMD_APPEND_CHILD => {
                 let node_id = reader.read_anchor(original_len)?;
                 let (child_tree, _) =
-                    read_hast_payload(&mut reader, &mut builder, original_len, node_id)?;
+                    read_hast_payload(&mut reader, &mut builder, original_len, node_id, false)?;
                 patches.push(Patch::AppendChild {
                     node_id,
                     child_tree,
@@ -1434,7 +1481,8 @@ pub fn apply_hast_commands_lenient(
             CMD_WRAP => {
                 let node_id = reader.read_anchor(original_len)?;
                 let (parent_tree, _) =
-                    read_hast_payload(&mut reader, &mut builder, original_len, node_id)?;
+                    read_hast_payload(&mut reader, &mut builder, original_len, node_id, true)?;
+                reject_void_wrap_parent(&parent_tree, builder.arena_mut())?;
                 patches.push(Patch::Wrap {
                     node_id,
                     parent_tree,
@@ -1444,7 +1492,7 @@ pub fn apply_hast_commands_lenient(
             CMD_REPLACE => {
                 let node_id = reader.read_anchor(original_len)?;
                 let (new_tree, keep_children) =
-                    read_hast_payload(&mut reader, &mut builder, original_len, node_id)?;
+                    read_hast_payload(&mut reader, &mut builder, original_len, node_id, false)?;
                 patches.push(Patch::Replace {
                     node_id,
                     new_tree,
@@ -1455,7 +1503,7 @@ pub fn apply_hast_commands_lenient(
             CMD_SET_CHILDREN => {
                 let node_id = reader.read_anchor(original_len)?;
                 let (new_children, _) =
-                    read_hast_payload(&mut reader, &mut builder, original_len, node_id)?;
+                    read_hast_payload(&mut reader, &mut builder, original_len, node_id, false)?;
                 patches.push(Patch::SetChildren {
                     node_id,
                     new_children,
@@ -2262,5 +2310,107 @@ mod tests {
         b.close_node();
         b.close_node();
         b.finish()
+    }
+
+    fn push_raw_command(buf: &mut Vec<u8>, cmd: u8, node_id: u32, raw: &str) {
+        buf.push(cmd);
+        push_u32(buf, node_id);
+        buf.push(PAYLOAD_RAW);
+        buf.push(0); // flags
+        push_u32(buf, raw.len() as u32);
+        buf.extend_from_slice(raw.as_bytes());
+    }
+
+    #[cfg(feature = "from-html")]
+    #[test]
+    fn hast_wrap_with_raw_html_payload() {
+        let arena = build_hast_element(&[]);
+        let mut buf = Vec::new();
+        push_raw_command(&mut buf, CMD_WRAP, 1, "<section class=\"wrap\"></section>");
+
+        let result = apply_hast_commands(arena, &buf).unwrap();
+        let section = result.get_children(0)[0];
+        assert_eq!(
+            result.get_str(decode_element_tag(result.get_type_data(section))),
+            "section"
+        );
+        let wrapped = result.get_children(section);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(
+            result.get_str(decode_element_tag(result.get_type_data(wrapped[0]))),
+            "div"
+        );
+    }
+
+    #[cfg(feature = "from-html")]
+    #[test]
+    fn hast_wrap_with_invalid_raw_html_errors() {
+        let arena = build_hast_element(&[]);
+        let mut buf = Vec::new();
+        push_raw_command(&mut buf, CMD_WRAP, 1, "just text");
+
+        let err = apply_hast_commands(arena, &buf).unwrap_err();
+        assert!(matches!(err, CommandError::InvalidWrapHtml(_)), "{err:?}");
+    }
+
+    /// The op-stream shape a `{type: "element"}` wrapper compiles to.
+    fn push_element_wrap_command(buf: &mut Vec<u8>, node_id: u32, tag: &str) {
+        let mut ops = Vec::new();
+        ops.push(OP_OPEN);
+        ops.push(HastNodeType::Element as u8);
+        op_str(&mut ops, OF_TAGNAME, tag);
+        ops.push(OP_CLOSE);
+
+        buf.push(CMD_WRAP);
+        push_u32(buf, node_id);
+        buf.push(PAYLOAD_OPSTREAM);
+        push_u32(buf, ops.len() as u32);
+        buf.extend_from_slice(&ops);
+    }
+
+    #[test]
+    fn hast_wrap_with_void_element_payload_errors() {
+        let arena = build_hast_element(&[]);
+        let mut buf = Vec::new();
+        push_element_wrap_command(&mut buf, 1, "img");
+
+        let err = apply_hast_commands(arena, &buf).unwrap_err();
+        assert!(
+            matches!(&err, CommandError::VoidWrapParent(tag) if tag == "img"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn hast_wrap_with_element_payload_wraps() {
+        let arena = build_hast_element(&[]);
+        let mut buf = Vec::new();
+        push_element_wrap_command(&mut buf, 1, "section");
+
+        let result = apply_hast_commands(arena, &buf).unwrap();
+        let section = result.get_children(0)[0];
+        assert_eq!(
+            result.get_str(decode_element_tag(result.get_type_data(section))),
+            "section"
+        );
+        let wrapped = result.get_children(section);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(
+            result.get_str(decode_element_tag(result.get_type_data(wrapped[0]))),
+            "div"
+        );
+    }
+
+    #[test]
+    fn hast_raw_payload_rejected_outside_wrap() {
+        let arena = build_hast_element(&[]);
+        let mut buf = Vec::new();
+        push_raw_command(&mut buf, CMD_INSERT_BEFORE, 1, "<span></span>");
+
+        let err = apply_hast_commands(arena, &buf).unwrap_err();
+        assert!(
+            matches!(err, CommandError::UnknownPayloadType(p) if p == PAYLOAD_RAW),
+            "{err:?}"
+        );
     }
 }

@@ -3,6 +3,7 @@ import {
   visitMdastHandle,
   resolveMdastSubscriptions,
   type MdastHandle,
+  type MdastParentContent,
   type MdastVisitorContext,
 } from "../src/mdast/mdast-visitor.js";
 import type { HastHandle } from "../src/hast/hast-visitor.js";
@@ -301,6 +302,127 @@ test("context.wrapNode() wraps a node in a parent", () => {
   expect(html).toContain("<blockquote>");
   expect(html).toContain("<h1>");
   expect(html).toMatch(/<blockquote>.*<h1>/s);
+});
+
+// Regression #182: a leaf wrapper silently dropped or displaced the node.
+test("context.wrapNode() rejects a leaf node as the wrapper", () => {
+  const html = visitAndRender("# Hello\n\nWorld", {
+    heading(node: MdastNode, ctx: MdastVisitorContext) {
+      expect(() =>
+        // @ts-expect-error html is a leaf, not a wrapNode parent
+        ctx.wrapNode(node, { type: "html", value: "<div></div>" }),
+      ).toThrow(/cannot hold children/);
+      expect(() =>
+        // @ts-expect-error text is a leaf, not a wrapNode parent
+        ctx.wrapNode(node, { type: "text", value: "x" }),
+      ).toThrow(/cannot hold children/);
+    },
+  });
+  expect(html).toMatch(/<h1>Hello<\/h1>/);
+});
+
+// Regression #182: a raw payload wrapped in the parse root, landing the
+// parsed content after the node.
+test("context.wrapNode() rejects raw content as the wrapper", () => {
+  const html = visitAndRender("# Hello\n\nWorld", {
+    heading(node: MdastNode, ctx: MdastVisitorContext) {
+      expect(() =>
+        // @ts-expect-error raw content is not a wrapNode parent
+        ctx.wrapNode(node, { rawHtml: "<div></div>" }),
+      ).toThrow(/raw content cannot wrap/);
+      expect(() =>
+        // @ts-expect-error raw content is not a wrapNode parent
+        ctx.wrapNode(node, { raw: "> quoted" }),
+      ).toThrow(/raw content cannot wrap/);
+    },
+  });
+  expect(html).toMatch(/<h1>Hello<\/h1>/);
+});
+
+test("context.wrapNode() accepts a user-defined parent node", () => {
+  const html = visitAndRender("# Hello\n\nWorld", {
+    heading(node: MdastNode, ctx: MdastVisitorContext) {
+      ctx.wrapNode(node, {
+        type: "callout",
+        data: { hName: "aside", hProperties: { className: ["callout"] } },
+        children: [],
+      });
+    },
+  });
+  expect(html).toContain('<aside class="callout"><h1>Hello</h1></aside>');
+});
+
+test("context.wrapNode() wraps a node in a bare user-defined parent", () => {
+  const html = visitAndRender("# Hello", {
+    heading(node: MdastNode, ctx: MdastVisitorContext) {
+      ctx.wrapNode(node, { type: "wrapper", children: [] });
+    },
+  });
+  expect(html).toContain("<div><h1>Hello</h1></div>");
+});
+
+// Lists are hand-written on purpose — independent of the LEAF_TYPES the check
+// reads, so a misclassified type surfaces here.
+test("context.wrapNode() accepts built-in parents and rejects built-in leaves", () => {
+  const parents: MdastParentContent[] = [
+    { type: "paragraph", children: [] },
+    { type: "heading", depth: 2, children: [] },
+    { type: "blockquote", children: [] },
+    { type: "list", children: [] },
+    { type: "listItem", children: [] },
+    { type: "table", children: [] },
+    { type: "tableRow", children: [] },
+    { type: "tableCell", children: [] },
+    { type: "emphasis", children: [] },
+    { type: "strong", children: [] },
+    { type: "delete", children: [] },
+    { type: "link", url: "#", children: [] },
+    { type: "footnoteDefinition", identifier: "a", children: [] },
+    { type: "containerDirective", name: "note", children: [] },
+    { type: "descriptionList", children: [] },
+    { type: "superscript", children: [] },
+  ];
+  const leaves = [
+    "thematicBreak",
+    "html",
+    "code",
+    "definition",
+    "text",
+    "inlineCode",
+    "break",
+    "image",
+    "imageReference",
+    "footnoteReference",
+    "yaml",
+    "toml",
+    "math",
+    "inlineMath",
+  ];
+  visitAndRender("# Hello", {
+    heading(node: MdastNode, ctx: MdastVisitorContext) {
+      for (const parent of parents) {
+        expect(() => ctx.wrapNode(node, parent), parent.type).not.toThrow();
+      }
+      for (const type of leaves) {
+        expect(
+          () => ctx.wrapNode(node, { type, value: "" } as unknown as MdastParentContent),
+          type,
+        ).toThrow(/cannot hold children/);
+      }
+    },
+  });
+});
+
+test("context.wrapNode() rejects a leaf-shaped custom wrapper", () => {
+  const html = visitAndRender("# Hello\n\nWorld", {
+    heading(node: MdastNode, ctx: MdastVisitorContext) {
+      expect(() =>
+        // @ts-expect-error a custom wrapper must declare a children array
+        ctx.wrapNode(node, { type: "marker", value: "x" }),
+      ).toThrow(/children array/);
+    },
+  });
+  expect(html).toMatch(/<h1>Hello<\/h1>/);
 });
 
 test("context.replaceNode() replaces a node via context method", () => {

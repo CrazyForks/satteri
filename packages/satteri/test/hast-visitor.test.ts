@@ -13,7 +13,7 @@ import { defineHastPlugin } from "../src/plugin.js";
 import { dropHandle } from "../src/index.js";
 import { collect } from "./fixtures.js";
 import type { HastNode } from "../src/hast/hast-materializer.js";
-import type { HastVisitorContext } from "../src/hast/hast-visitor.js";
+import type { HastParentContent, HastVisitorContext } from "../src/hast/hast-visitor.js";
 import type { Element, ElementContent, Text } from "hast";
 import type { Position } from "unist";
 
@@ -307,6 +307,158 @@ describe("visitHastHandle - mutations", () => {
     expect(html).toContain(
       '<div class="heading-wrapper"><h1>Hello</h1><a href="#hello">#</a></div>',
     );
+  });
+
+  test("context.wrapNode() accepts a rawHtml wrapper, parsed to an element", () => {
+    const { handle, source } = setup("# Hello");
+    const plugin = {
+      element: {
+        filter: ["h1"],
+        visit(node: HastNode, ctx: HastVisitorContext) {
+          ctx.wrapNode(node, { rawHtml: '<div class="callout"></div>' });
+        },
+      },
+    };
+    const subs = resolveSubscriptions(plugin);
+    visitHastHandle(handle, plugin, subs, source, undefined);
+    const html = renderHandle(handle);
+    expect(html).toContain('<div class="callout"><h1>Hello</h1></div>');
+  });
+
+  test("context.wrapNode() keeps a rawHtml wrapper's own children after the wrapped node", () => {
+    const { handle, source } = setup("# Hello");
+    const plugin = {
+      element: {
+        filter: ["h1"],
+        visit(node: HastNode, ctx: HastVisitorContext) {
+          ctx.wrapNode(node, { rawHtml: '<div><a href="#hello">#</a></div>' });
+        },
+      },
+    };
+    const subs = resolveSubscriptions(plugin);
+    visitHastHandle(handle, plugin, subs, source, undefined);
+    const html = renderHandle(handle);
+    expect(html).toContain('<div><h1>Hello</h1><a href="#hello">#</a></div>');
+  });
+
+  test("context.wrapNode() rejects rawHtml that is not exactly one element", () => {
+    for (const rawHtml of ["just text", "<i></i><b></b>", ""]) {
+      const { handle, source } = setup("# Hello");
+      const plugin = {
+        element: {
+          filter: ["h1"],
+          visit(node: HastNode, ctx: HastVisitorContext) {
+            ctx.wrapNode(node, { rawHtml });
+          },
+        },
+      };
+      const subs = resolveSubscriptions(plugin);
+      expect(() => visitHastHandle(handle, plugin, subs, source, undefined)).toThrow(
+        /exactly one element/,
+      );
+    }
+  });
+
+  test("context.wrapNode() rejects a void element as rawHtml wrapper", () => {
+    const { handle, source } = setup("# Hello");
+    const plugin = {
+      element: {
+        filter: ["h1"],
+        visit(node: HastNode, ctx: HastVisitorContext) {
+          ctx.wrapNode(node, { rawHtml: '<img src="x.png">' });
+        },
+      },
+    };
+    const subs = resolveSubscriptions(plugin);
+    expect(() => visitHastHandle(handle, plugin, subs, source, undefined)).toThrow(/void element/);
+  });
+
+  test("context.wrapNode() rejects a void element node as the wrapper", () => {
+    for (const tagName of ["img", "br"]) {
+      const { handle, source } = setup("# Hello");
+      const plugin = {
+        element: {
+          filter: ["h1"],
+          visit(node: HastNode, ctx: HastVisitorContext) {
+            ctx.wrapNode(node, { type: "element", tagName, properties: {}, children: [] });
+          },
+        },
+      };
+      const subs = resolveSubscriptions(plugin);
+      expect(() => visitHastHandle(handle, plugin, subs, source, undefined)).toThrow(
+        /void element/,
+      );
+    }
+  });
+
+  // Runtime companion to the compile-time parity check in hast-visitor.ts.
+  test("context.wrapNode() accepts every parent-capable HAST type", () => {
+    const wrappers: HastParentContent[] = [
+      { type: "element", tagName: "div", properties: {}, children: [] },
+      { type: "mdxJsxFlowElement", name: "Box", attributes: [], children: [] },
+      { type: "mdxJsxTextElement", name: "Badge", attributes: [], children: [] },
+    ];
+    for (const wrapper of wrappers) {
+      const { handle, source } = setup("# Hello");
+      const plugin = {
+        element: {
+          filter: ["h1"],
+          visit(node: HastNode, ctx: HastVisitorContext) {
+            expect(() => ctx.wrapNode(node, wrapper)).not.toThrow();
+          },
+        },
+      };
+      visitHastHandle(handle, plugin, resolveSubscriptions(plugin), source, undefined);
+    }
+  });
+
+  test("context.wrapNode() wraps a node in an MDX JSX element", () => {
+    const handle = createMdxHastHandle("# Hello\n");
+    const source = getHandleSource(handle);
+    const plugin = {
+      element: {
+        filter: ["h1"],
+        visit(node: HastNode, ctx: HastVisitorContext) {
+          ctx.wrapNode(node, {
+            type: "mdxJsxFlowElement",
+            name: "Callout",
+            attributes: [],
+            children: [],
+          });
+        },
+      },
+    };
+    visitHastHandle(handle, plugin, resolveSubscriptions(plugin), source, undefined);
+    const tree = materializeHastTree(new HastReader(serializeHandle(handle)));
+    const jsx = findHastNode(tree, "mdxJsxFlowElement");
+    if (jsx?.type !== "mdxJsxFlowElement") throw new Error("expected mdxJsxFlowElement");
+    expect(jsx.name).toBe("Callout");
+    const wrapped = jsx.children[0];
+    expect(wrapped?.type === "element" && wrapped.tagName).toBe("h1");
+  });
+
+  // Regression #182: a leaf wrapper silently dropped or displaced the node.
+  test("context.wrapNode() rejects a leaf node as the wrapper", () => {
+    const { handle, source } = setup("# Hello");
+    const plugin = {
+      element: {
+        filter: ["h1"],
+        visit(node: HastNode, ctx: HastVisitorContext) {
+          expect(() =>
+            // @ts-expect-error raw is a leaf, not a wrapNode parent
+            ctx.wrapNode(node, { type: "raw", value: "<div></div>" }),
+          ).toThrow(/cannot hold children/);
+          expect(() =>
+            // @ts-expect-error text is a leaf, not a wrapNode parent
+            ctx.wrapNode(node, { type: "text", value: "x" }),
+          ).toThrow(/cannot hold children/);
+        },
+      },
+    };
+    const subs = resolveSubscriptions(plugin);
+    visitHastHandle(handle, plugin, subs, source, undefined);
+    const html = renderHandle(handle);
+    expect(html).toContain("<h1>Hello</h1>");
   });
 
   test("context.appendChild() adds a child to an element", () => {
