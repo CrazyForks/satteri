@@ -4,6 +4,7 @@
 use alloc::{string::String, vec::Vec};
 use core::{cmp::max, ops::Range};
 
+use satteri_arena::line_ending_iter;
 use unicase::UniCase;
 
 #[cfg(feature = "mdx")]
@@ -436,13 +437,12 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         // A term may sit at most one blank line from its
                         // definition (pandoc / mdast-util-definition-list); two+
                         // disconnect it. `item.end` includes the paragraph's
-                        // trailing newline, so the gap to the marker holds 0
-                        // newlines when tight, 1 when loose, 2+ when disconnected.
+                        // trailing line ending, so the gap to the marker holds 0
+                        // line endings when tight, 1 when loose, 2+ when disconnected.
                         ItemBody::Paragraph | ItemBody::TightParagraph => {
                             let gap_start = item.end.min(container_start);
-                            bytes[gap_start..container_start]
-                                .iter()
-                                .filter(|&&b| b == b'\n')
+                            line_ending_iter(&bytes[gap_start..container_start])
+                                .take(2)
                                 .count()
                                 <= 1
                         }
@@ -895,10 +895,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                                     }
                                     let chunk_start = pos;
                                     while pos < bytes.len() {
-                                        let eol = memchr::memchr(b'\n', &bytes[pos..])
-                                            .map(|i| pos + i + 1)
-                                            .unwrap_or(bytes.len());
-                                        pos = eol;
+                                        pos += scan_nextline(&bytes[pos..]);
                                         if pos < bytes.len()
                                             && (bytes[pos] == b'\n' || bytes[pos] == b'\r')
                                         {
@@ -1664,33 +1661,39 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             if next_start <= prev_end {
                 return false;
             }
-            // Allow exactly one newline (the def's line terminator)
+            // Allow exactly one line ending (the def's line terminator)
             // plus any amount of leading whitespace on the next line.
             // Indented-code can't interrupt the def's still-open
             // paragraph, so even 4+ space indents are valid paragraph
             // continuations and qualify for chain-back.
-            let mut newlines = 0;
-            for &b in &bytes[prev_end..next_start] {
-                if b == b'\n' {
-                    if newlines > 0 {
+            let gap = &bytes[prev_end..next_start];
+            let mut line_endings = 0;
+            let mut i = 0;
+            while i < gap.len() {
+                let b = gap[i];
+                if b == b'\n' || b == b'\r' {
+                    if line_endings > 0 {
                         return false;
                     }
-                    newlines += 1;
-                } else if b == b'\r' {
-                    if newlines > 0 {
-                        return false;
-                    }
+                    line_endings += 1;
+                    // A CRLF terminates one line, not two.
+                    i += if b == b'\r' && gap.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
                 } else if b == b' ' || b == b'\t' {
-                    if newlines == 0 {
+                    if line_endings == 0 {
                         return false;
                     }
                     // OK: whitespace after the line break is the
                     // next line's leading indent.
+                    i += 1;
                 } else {
                     return false;
                 }
             }
-            newlines == 1
+            line_endings == 1
         };
         let original_start = self.tree[node_ix].item.start;
         // Don't chain back when the heading's *first* content line is
@@ -1701,9 +1704,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         // token — so the heading no longer inherits the def's start.
         // Other content-line shapes (plain text, `*`, `+`, …) leave the
         // paragraph token intact and the chain-back applies.
-        let first_line_end = bytes[original_start..ix]
-            .iter()
-            .position(|&b| b == b'\n')
+        let first_line_end = memchr::memchr2(b'\n', b'\r', &bytes[original_start..ix])
             .map(|p| original_start + p)
             .unwrap_or(ix);
         let first_line = &bytes[original_start..first_line_end];
@@ -3460,10 +3461,11 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         linebuf.as_mut().unwrap()
                     };
                     linebuf.push_str(&text[linestart..bytecount]);
-                    linebuf.push('\n'); // normalize line breaks
-                                        // skip line break
+                    // The title's line endings are content, kept byte for byte.
+                    linebuf.push(c as char);
                     bytecount += 1;
                     if c == b'\r' && bytes.get(bytecount) == Some(&b'\n') {
+                        linebuf.push('\n');
                         bytecount += 1;
                     }
                     let mut line_start = LineStart::new(&bytes[bytecount..]);

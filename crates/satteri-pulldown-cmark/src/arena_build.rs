@@ -3,7 +3,7 @@
 
 use alloc::borrow::Cow;
 
-use satteri_arena::{Arena, ArenaBuilder, LineIndex, Mdast, StringRef};
+use satteri_arena::{line_ending_iter, Arena, ArenaBuilder, LineIndex, Mdast, StringRef};
 use satteri_ast::mdast::{
     encode_directive_data, encode_image_reference_data, encode_reference_data, encode_table_data,
     CodeData, ColumnAlign, DefinitionData, DescriptionDetailsData, FootnoteDefinitionData,
@@ -488,7 +488,7 @@ fn parse_inner(
                         }
                         let is_spread = *item_spread || {
                             // Loose-list detection: a blank line between
-                            // consecutive children means two newlines in the
+                            // consecutive children means two line endings in the
                             // source gap. Counted on byte offsets, not lines, because
                             // skip-positions mode leaves `start_line` zero but
                             // offsets are always recorded.
@@ -502,7 +502,7 @@ fn parse_inner(
                                     let end = child_node.start_offset as usize;
                                     if start <= end && end <= source_bytes.len() {
                                         let gap = &source_bytes[start..end];
-                                        if memchr::memchr_iter(b'\n', gap).take(2).count() >= 2 {
+                                        if line_ending_iter(gap).take(2).count() >= 2 {
                                             found = true;
                                             break;
                                         }
@@ -613,7 +613,7 @@ fn parse_inner(
                                     let end = child_node.start_offset as usize;
                                     if start <= end && end <= source_bytes.len() {
                                         let gap = &source_bytes[start..end];
-                                        if memchr::memchr_iter(b'\n', gap).take(2).count() >= 2 {
+                                        if line_ending_iter(gap).take(2).count() >= 2 {
                                             found = true;
                                             break;
                                         }
@@ -880,11 +880,18 @@ fn parse_inner(
                             let cow = inner.allocs.take_cow(*cow_ix);
                             buf.push_str(&cow);
                         }
-                        ItemBody::SoftBreak | ItemBody::HardBreak(_) => {
-                            // Remark preserves the newline in alt text rather
-                            // than collapsing it to a space.
-                            buf.push('\n');
+                        ItemBody::SoftBreak => {
+                            // Alt text keeps the break rather than collapsing it
+                            // to a space, and keeps the source's own line ending.
+                            let s = &source[item.start..item.end];
+                            match s.find(['\r', '\n']) {
+                                Some(eol) => buf.push_str(&s[eol..]),
+                                None => buf.push('\n'),
+                            }
                         }
+                        // A hard break carries no visible content, so it adds
+                        // nothing to the alt text.
+                        ItemBody::HardBreak(_) => {}
                         ItemBody::SynthesizeText(cow_ix) => {
                             let cow = inner.allocs.take_cow(*cow_ix);
                             buf.push_str(&cow);
@@ -2420,11 +2427,14 @@ fn encode_heading_h_properties(attrs: &HeadingAttributes<'_>) -> Option<Vec<u8>>
 fn byte_offset_to_line_col(source: &str, offset: usize) -> String {
     let mut line = 1usize;
     let mut col = 1usize;
+    let bytes = source.as_bytes();
     for (i, ch) in source.char_indices() {
         if i >= offset {
             break;
         }
-        if ch == '\n' {
+        // `\r`, `\n` and `\r\n` all end a line; the `\r` of a CRLF is left to
+        // the `\n` so the pair counts once.
+        if ch == '\n' || (ch == '\r' && bytes.get(i + 1) != Some(&b'\n')) {
             line += 1;
             col = 1;
         } else {

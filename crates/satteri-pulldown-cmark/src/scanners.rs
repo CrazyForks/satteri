@@ -23,7 +23,7 @@
 use alloc::{string::String, vec::Vec};
 use core::char;
 
-use memchr::memchr;
+use memchr::{memchr, memchr2};
 
 pub(crate) use crate::puncttable::{is_ascii_punctuation, is_punctuation};
 use crate::{
@@ -582,7 +582,12 @@ pub(crate) fn scan_blank_line(bytes: &[u8]) -> Option<usize> {
 }
 
 pub(crate) fn scan_nextline(bytes: &[u8]) -> usize {
-    memchr(b'\n', bytes).map_or(bytes.len(), |x| x + 1)
+    match memchr2(b'\n', b'\r', bytes) {
+        // A CRLF is one line ending, so step past both bytes.
+        Some(i) if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') => i + 2,
+        Some(i) => i + 1,
+        None => bytes.len(),
+    }
 }
 
 // return: end byte for closing code fence, or None
@@ -1379,9 +1384,9 @@ fn scan_attribute_value(
 pub(crate) fn unescape<'a, I: Into<CowStr<'a>>>(input: I, is_in_table: bool) -> CowStr<'a> {
     let input = input.into();
     let bytes = input.as_bytes();
-    // Only `\`, `&` and `\r` can trigger a rewrite. Skip straight to the first
-    // one; if there is none the input is returned untouched without allocating.
-    let Some(first) = memchr::memchr3(b'\\', b'&', b'\r', bytes) else {
+    // Only `\` and `&` can trigger a rewrite. Skip straight to the first one;
+    // if there is none the input is returned untouched without allocating.
+    let Some(first) = memchr::memchr2(b'\\', b'&', bytes) else {
         return input;
     };
     let mut result = String::new();
@@ -1413,11 +1418,6 @@ pub(crate) fn unescape<'a, I: Into<CowStr<'a>>>(input: I, is_in_table: bool) -> 
                 }
                 _ => i = next_unescape_candidate(bytes, i + 1),
             },
-            [b'\r', ..] => {
-                result.push_str(&input[mark..i]);
-                i += 1;
-                mark = i;
-            }
             // This byte isn't an escape (a candidate that didn't pan out, or a
             // plain byte landed on after a rewrite). Jump to the next candidate
             // rather than walking one byte at a time.
@@ -1432,11 +1432,11 @@ pub(crate) fn unescape<'a, I: Into<CowStr<'a>>>(input: I, is_in_table: bool) -> 
     }
 }
 
-/// Index of the next `\`, `&` or `\r` at or after `from`, or `bytes.len()`
-/// when there is none (which ends `unescape`'s scan loop).
+/// Index of the next `\` or `&` at or after `from`, or `bytes.len()` when
+/// there is none (which ends `unescape`'s scan loop).
 #[inline]
 fn next_unescape_candidate(bytes: &[u8], from: usize) -> usize {
-    match memchr::memchr3(b'\\', b'&', b'\r', &bytes[from..]) {
+    match memchr::memchr2(b'\\', b'&', &bytes[from..]) {
         Some(rel) => from + rel,
         None => bytes.len(),
     }
@@ -1774,6 +1774,30 @@ pub(crate) fn scan_inline_html_processing(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn scan_nextline_line_endings() {
+        assert_eq!(scan_nextline(b"abc\ndef"), 4);
+        assert_eq!(scan_nextline(b"abc\rdef"), 4);
+        assert_eq!(scan_nextline(b"abc\r\ndef"), 5);
+        assert_eq!(scan_nextline(b"abc"), 3);
+        assert_eq!(scan_nextline(b""), 0);
+        // A `\r` last in the slice has no `\n` to pair with.
+        assert_eq!(scan_nextline(b"abc\r"), 4);
+    }
+
+    #[test]
+    fn unescape_preserves_line_endings() {
+        // Line endings are content here; only escapes and entities are rewritten.
+        assert_eq!(unescape("a\r\nb", false).as_ref(), "a\r\nb");
+        assert_eq!(unescape("a\rb", false).as_ref(), "a\rb");
+        assert_eq!(unescape("\r", false).as_ref(), "\r");
+        assert_eq!(unescape("a\r\rb", false).as_ref(), "a\r\rb");
+        assert_eq!(unescape("a\nb", false).as_ref(), "a\nb");
+        assert_eq!(unescape("a\r\n\\*b", false).as_ref(), "a\r\n*b");
+        assert_eq!(unescape("a\r&amp;b", false).as_ref(), "a\r&b");
+    }
+
     #[test]
     fn overflow_list() {
         assert!(

@@ -2033,7 +2033,11 @@ impl<'input> ParserInner<'input> {
                 if let Some(node_ix) = scan_nodes_to_ix(&self.tree, node, i + 1) {
                     if self.tree[node_ix].item.start > i {
                         title.push_str(&text[mark..i]);
-                        title.push('\n');
+                        // The title's line endings are content, kept byte for byte.
+                        title.push(c as char);
+                        if c == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                            title.push('\n');
+                        }
                         i = self.tree[node_ix].item.start;
                         mark = i;
                         continue;
@@ -2165,35 +2169,10 @@ impl<'input> ParserInner<'input> {
             }
         }
 
-        let (opening, closing, all_spaces) = {
-            let s = if let Some(buf) = &mut buf {
-                buf.push_str(&spanned_text[start_ix..]);
-                &buf[..]
-            } else {
-                spanned_text
-            };
-            (
-                matches!(s.as_bytes().first(), Some(b' ' | b'\n')),
-                matches!(s.as_bytes().last(), Some(b' ' | b'\n')),
-                s.bytes().all(|b| b == b' ' || b == b'\n'),
-            )
-        };
-
-        let cow: CowStr<'input> = if !all_spaces && opening && closing {
-            if let Some(mut buf) = buf {
-                if !buf.is_empty() {
-                    buf.remove(0);
-                    buf.pop();
-                }
-                buf.into()
-            } else {
-                spanned_text[1..(spanned_text.len() - 1).max(1)].into()
-            }
-        } else if let Some(buf) = buf {
-            buf.into()
-        } else {
-            spanned_text.into()
-        };
+        if let Some(buf) = &mut buf {
+            buf.push_str(&spanned_text[start_ix..]);
+        }
+        let cow: CowStr<'input> = strip_span_padding(buf, spanned_text);
 
         self.tree[open].item.body = ItemBody::Math(self.allocs.allocate_cow(cow), false);
         self.tree[open].item.end = self.tree[close_end].item.end;
@@ -2216,10 +2195,13 @@ impl<'input> ParserInner<'input> {
             let c = spanned_bytes[ix];
             if c == b'\r' || c == b'\n' {
                 let buf = buf.get_or_insert_with(|| String::with_capacity(spanned_bytes.len()));
+                // The span's own line endings are content and are kept byte for
+                // byte; only the container prefix below is stripped.
                 buf.push_str(&spanned_text[start_ix..ix]);
-                buf.push('\n');
+                buf.push(c as char);
                 ix += 1;
                 if c == b'\r' && spanned_bytes.get(ix) == Some(&b'\n') {
+                    buf.push('\n');
                     ix += 1;
                 }
                 // Use the full source bytes from this position (not just
@@ -2259,35 +2241,10 @@ impl<'input> ParserInner<'input> {
             }
         }
 
-        let (opening, closing, all_spaces) = {
-            let s = if let Some(buf) = &mut buf {
-                buf.push_str(&spanned_text[start_ix..]);
-                &buf[..]
-            } else {
-                spanned_text
-            };
-            (
-                matches!(s.as_bytes().first(), Some(b' ' | b'\n')),
-                matches!(s.as_bytes().last(), Some(b' ' | b'\n')),
-                s.bytes().all(|b| b == b' ' || b == b'\n'),
-            )
-        };
-
-        let cow: CowStr<'input> = if !all_spaces && opening && closing {
-            if let Some(mut buf) = buf {
-                if !buf.is_empty() {
-                    buf.remove(0);
-                    buf.pop();
-                }
-                buf.into()
-            } else {
-                spanned_text[1..(spanned_text.len() - 1).max(1)].into()
-            }
-        } else if let Some(buf) = buf {
-            buf.into()
-        } else {
-            spanned_text.into()
-        };
+        if let Some(buf) = &mut buf {
+            buf.push_str(&spanned_text[start_ix..]);
+        }
+        let cow: CowStr<'input> = strip_span_padding(buf, spanned_text);
 
         if preceding_backslash {
             self.tree[open].item.body = ItemBody::Text {
@@ -2388,6 +2345,43 @@ pub(crate) fn scan_containers(
         i += 1;
     }
     i
+}
+
+/// Strip one leading and one trailing space or line ending from a code or math
+/// span, but only when both are present and the span isn't all whitespace. A
+/// CRLF is a single line ending, so it goes as a pair.
+///
+/// `buf` is the span's rewritten content when a container prefix or `\|` escape
+/// forced an allocation; otherwise the span is `spanned_text` verbatim.
+fn strip_span_padding<'input>(buf: Option<String>, spanned_text: &'input str) -> CowStr<'input> {
+    let s = buf.as_deref().unwrap_or(spanned_text);
+    let lead = if s.starts_with("\r\n") {
+        2
+    } else {
+        usize::from(matches!(s.as_bytes().first(), Some(b' ' | b'\n' | b'\r')))
+    };
+    let trail = if s.ends_with("\r\n") {
+        2
+    } else {
+        usize::from(matches!(s.as_bytes().last(), Some(b' ' | b'\n' | b'\r')))
+    };
+    let all_spaces = s.bytes().all(|b| matches!(b, b' ' | b'\n' | b'\r'));
+
+    if !all_spaces && lead > 0 && trail > 0 {
+        if let Some(mut buf) = buf {
+            if !buf.is_empty() {
+                buf.truncate(buf.len() - trail);
+                buf.replace_range(..lead, "");
+            }
+            buf.into()
+        } else {
+            spanned_text[lead..(spanned_text.len() - trail).max(lead)].into()
+        }
+    } else if let Some(buf) = buf {
+        buf.into()
+    } else {
+        spanned_text.into()
+    }
 }
 
 pub(crate) fn skip_container_prefixes(tree: &Tree<Item>, bytes: &[u8], options: Options) -> usize {

@@ -157,6 +157,67 @@ describe("MDAST conformance: images", () => {
   });
 });
 
+// A hard break inside an image label carries no visible content, so it adds
+// nothing to the flattened alt text; a soft break contributes the source's own
+// line ending.
+describe("MDAST conformance: line breaks in image alt text", () => {
+  test("backslash hard break", () => {
+    assertMdastConformance("![a\\\nb](c.png)");
+  });
+
+  test("backslash hard break with CRLF", () => {
+    assertMdastConformance("![a\\\r\nb](c.png)");
+  });
+
+  test("backslash hard break with a lone CR", () => {
+    assertMdastConformance("![a\\\rb](c.png)");
+  });
+
+  test("repeated backslash hard breaks", () => {
+    assertMdastConformance("![a\\\nb\\\nc](c.png)");
+  });
+
+  test("trailing-space hard break", () => {
+    assertMdastConformance("![a  \nb](c.png)");
+  });
+
+  test("trailing-space hard break with CRLF", () => {
+    assertMdastConformance("![a  \r\nb](c.png)");
+  });
+
+  test("trailing-space hard break with a lone CR", () => {
+    assertMdastConformance("![a  \rb](c.png)");
+  });
+
+  test("soft break", () => {
+    assertMdastConformance("![a\nb](c.png)");
+  });
+
+  test("soft break with CRLF", () => {
+    assertMdastConformance("![a\r\nb](c.png)");
+  });
+
+  test("soft break with a lone CR", () => {
+    assertMdastConformance("![a\rb](c.png)");
+  });
+
+  test("inline code in the label", () => {
+    assertMdastConformance("![a`x`b](c.png)");
+  });
+
+  test("emphasis in the label", () => {
+    assertMdastConformance("![a*x*b](c.png)");
+  });
+
+  test("hard break in a reference image label", () => {
+    assertMdastConformance("![a\\\nb][d]\n\n[d]: /u");
+  });
+
+  test("hard break in a collapsed reference image label", () => {
+    assertMdastConformance("![a\\\nb][]\n\n[a\\\nb]: /u");
+  });
+});
+
 describe("MDAST conformance: edge cases", () => {
   test("empty input", () => {
     assertMdastConformance("");
@@ -495,6 +556,163 @@ describe("MDAST conformance: softbreak preserves CRLF", () => {
   test("plain LF softbreak still works", () => {
     assertMdastConformance("a\nb");
   });
+});
+
+// CommonMark counts `\n`, `\r` and `\r\n` alike as line endings. The line
+// table was built by scanning for `\n` only, so a lone `\r` left every later
+// node on the previous line (offsets were unaffected).
+describe("MDAST conformance: standalone CR positions", () => {
+  test("paragraph across a lone CR", () => {
+    assertMdastConformance("a\rb");
+  });
+
+  test("lone CR inside a link destination", () => {
+    assertMdastConformance("[Mercury](\rmercury)");
+  });
+
+  test("mixed CR, CRLF and LF in one document", () => {
+    assertMdastConformance("a\r\nb\rc\nd");
+  });
+
+  test("CR at document start", () => {
+    assertMdastConformance("\ra");
+  });
+
+  test("CR at document end", () => {
+    assertMdastConformance("a\r");
+  });
+
+  test("consecutive CRs separate blocks", () => {
+    assertMdastConformance("a\r\rb");
+  });
+
+  test("lone CR across block structures", () => {
+    assertMdastConformance("# h\rp\r\n- x\r  y");
+  });
+
+  test("lone CR in a blockquote", () => {
+    assertMdastConformance("> q\rq2");
+  });
+
+  test("lone CR with multibyte characters", () => {
+    assertMdastConformance("❤️a\r😀b\rc");
+  });
+});
+
+// Block structure was decided by scanning for `\n` only, so a document whose
+// line endings are all lone `\r` was read as a single line.
+describe("MDAST conformance: standalone CR block structure", () => {
+  test("blank line between list items makes the list loose", () => {
+    assertMdastConformance("- a\r\r- b");
+  });
+
+  test("fenced code block", () => {
+    assertMdastConformance("```js\rcode\r```\r");
+  });
+
+  test("fenced code block left open", () => {
+    assertMdastConformance("```js\rcode\r");
+  });
+
+  test("indented code block strips continuation indentation", () => {
+    assertMdastConformance("    a\r    b\r");
+  });
+
+  test("HTML block ends at a blank line", () => {
+    assertMdastConformance("<div>\ra\r\rb\r");
+  });
+
+  test("setext heading underline", () => {
+    assertMdastConformance("title\r=====\r");
+  });
+
+  test("thematic break between paragraphs", () => {
+    assertMdastConformance("a\r***\rb");
+  });
+
+  test("nested list indentation", () => {
+    assertMdastConformance("- a\r  - b\r    - c\r");
+  });
+
+  test("block quote with a lazy continuation line", () => {
+    assertMdastConformance("> a\rb\r\rc");
+  });
+
+  test("link reference definition followed by a use", () => {
+    assertMdastConformance("[foo]: /url\r\r[foo]\r");
+  });
+
+  test("setext heading directly after a definition inherits its start", () => {
+    assertMdastConformance("[foo]: /url\rtitle\r=====\r");
+  });
+
+  test("setext heading after a run of definitions", () => {
+    assertMdastConformance("[a]: /a\r[b]: /b\r  title\r=====\r");
+  });
+
+  test("blank line between a definition and a setext heading breaks the chain", () => {
+    assertMdastConformance("[foo]: /url\r\rtitle\r=====\r");
+  });
+
+  test("hard line break before a lone CR", () => {
+    assertMdastConformance("a  \rb");
+  });
+
+  test("table", () => {
+    assertMdastConformance("| a | b |\r| - | - |\r| 1 | 2 |\r");
+  });
+});
+
+// Values carry the document's own line endings byte for byte; only the
+// matching `identifier` of a definition is normalized.
+describe("MDAST conformance: line endings inside values", () => {
+  const FLAVORS: [string, string][] = [
+    ["LF", "\n"],
+    ["CRLF", "\r\n"],
+    ["CR", "\r"],
+  ];
+
+  for (const [name, eol] of FLAVORS) {
+    describe(name, () => {
+      const md = (tpl: string) => tpl.split("EOL").join(eol);
+
+      test("inline code span", () => {
+        assertMdastConformance(md("`fooEOLbar`EOL"));
+      });
+
+      test("inline code span stripped of one leading and trailing line ending", () => {
+        assertMdastConformance(md("``EOLfooEOLbar  EOLbazEOL``EOL"));
+      });
+
+      test("inline code span holding only a line ending", () => {
+        assertMdastConformance(md("`EOL`EOL"));
+      });
+
+      test("definition title", () => {
+        assertMdastConformance(md("[foo]: /url 'tEOLt2'EOLEOL[foo]EOL"));
+      });
+
+      test("definition title in parentheses", () => {
+        assertMdastConformance(md("[foo]: /url (tEOLt2)EOLEOL[foo]EOL"));
+      });
+
+      test("definition label", () => {
+        assertMdastConformance(md("[EOLfooEOL]: /urlEOLbarEOL"));
+      });
+
+      test("definition label with indented continuation", () => {
+        assertMdastConformance(md("[FooEOL  bar]: /urlEOLEOL[Baz][Foo bar]EOL"));
+      });
+
+      test("inline link title", () => {
+        assertMdastConformance(md("[a](/u 'tEOLt2')EOL"));
+      });
+
+      test("code block value", () => {
+        assertMdastConformance(md("    aEOL    bEOL"));
+      });
+    });
+  }
 });
 
 describe("MDAST conformance: closing code fence whitespace", () => {
