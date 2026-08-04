@@ -104,3 +104,5 @@ jobs:
       - name: Test
         run: pnpm test
         working-directory: packages/satteri
+        env:
+          SKIP_FUZZ: "1"

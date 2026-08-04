@@ -67,11 +67,15 @@ pub(crate) enum ItemBody {
     // quote byte, can_open, can_close
     MaybeSmartQuote(u8, bool, bool),
     MaybeCode(usize, bool), // number of backticks, preceded by backslash
-    MaybeHtml,
+    MaybeHtml(bool),        // preceded by backslash
     MaybeLinkOpen,
     // bool indicates whether or not the preceding section could be a reference
     MaybeLinkClose(bool),
     MaybeImage,
+    /// Zero-width marker where a GFM autolink literal would start. Firing is
+    /// decided in `handle_inline_pass1`, where bracket-resolution state is
+    /// known; it never survives into `arena_build`.
+    MaybeAutolink(AutolinkCandidateIndex),
 
     // These are inline items after resolution.
     Emphasis,
@@ -108,7 +112,10 @@ pub(crate) enum ItemBody {
     TightParagraph,
     Rule,
     Heading(HeadingLevel, Option<HeadingIndex>), // heading level
-    FencedCodeBlock(CowIndex),
+    // u32: byte length of the `lang` part within the decoded info string. The
+    // split is taken on raw source, so a character reference decoding to
+    // whitespace does not move it.
+    FencedCodeBlock(CowIndex, u32),
     MathBlock(CowIndex), // meta string (info after $$)
     // bool: true = lazy/no-extend (block was opened as a single-line
     // synthetic split, e.g. after an empty list item closed via blank
@@ -166,10 +173,11 @@ impl ItemBody {
                 | MaybeMath(..)
                 | MaybeSmartQuote(..)
                 | MaybeCode(..)
-                | MaybeHtml
+                | MaybeHtml(..)
                 | MaybeLinkOpen
                 | MaybeLinkClose(..)
                 | MaybeImage
+                | MaybeAutolink(..)
         )
     }
     pub(crate) fn is_block_level(&self) -> bool {
@@ -183,10 +191,11 @@ impl ItemBody {
                 | MaybeMath(..)
                 | MaybeSmartQuote(..)
                 | MaybeCode(..)
-                | MaybeHtml
+                | MaybeHtml(..)
                 | MaybeLinkOpen
                 | MaybeLinkClose(..)
                 | MaybeImage
+                | MaybeAutolink(..)
                 | Emphasis
                 | Strong
                 | Strikethrough
@@ -654,7 +663,16 @@ impl<'input> ParserInner<'input> {
 
         while let Some(mut cur_ix) = cur {
             match self.tree[cur_ix].item.body {
-                ItemBody::MaybeHtml => {
+                ItemBody::MaybeHtml(preceded_by_backslash) => {
+                    if preceded_by_backslash {
+                        // No autolink claimed the `\`, so the `<` is literal.
+                        self.tree[cur_ix].item.body = ItemBody::Text {
+                            backslash_escaped: true,
+                        };
+                        prev = cur;
+                        cur = self.tree[cur_ix].next;
+                        continue;
+                    }
                     // MDX inline JSX: check before HTML
                     #[cfg(feature = "mdx")]
                     if self.options.contains(Options::ENABLE_MDX) {
@@ -1147,6 +1165,81 @@ impl<'input> ParserInner<'input> {
                             self.tree[cur_ix].item.body = ItemBody::Text {
                                 backslash_escaped: preceded_by_backslash,
                             };
+                        }
+                    }
+                }
+                ItemBody::MaybeAutolink(cand_ix) => {
+                    // An unresolved bracket opener blocks the construct, and
+                    // the stack holds exactly those.
+                    let next = self.tree[cur_ix].next;
+                    if !self.link_stack.is_empty() {
+                        // Zero-width `Text` rather than an unlink: the emphasis
+                        // resolver addresses nodes by arena index, so dropping
+                        // one from the chain would hand it whatever came next.
+                        self.tree[cur_ix].item.body = ItemBody::Text {
+                            backslash_escaped: false,
+                        };
+                        prev = cur;
+                        cur = next;
+                        continue;
+                    }
+                    // Reusing the marker node as the `Link` keeps the preceding
+                    // sibling's `next` pointer valid.
+                    let cand = self.allocs[cand_ix];
+                    let node_after = scan_nodes_to_ix(&self.tree, next, cand.end);
+                    let text_child = self.tree.create_node(Item {
+                        start: cand.start,
+                        end: cand.end,
+                        body: ItemBody::Text {
+                            backslash_escaped: false,
+                        },
+                    });
+                    self.tree[cur_ix].item = Item {
+                        start: cand.start,
+                        end: cand.end,
+                        body: ItemBody::Link(cand.link),
+                    };
+                    self.tree[cur_ix].child = Some(text_child);
+                    self.tree[cur_ix].next = node_after;
+                    if let Some(node_after_ix) = node_after {
+                        let orig_start = self.tree[node_after_ix].item.start;
+                        let new_start = max(orig_start, cand.end);
+                        // A `\` the first pass read as a hard-break marker
+                        // turns out to be the URL's last byte.
+                        if orig_start < cand.end
+                            && matches!(
+                                self.tree[node_after_ix].item.body,
+                                ItemBody::HardBreak(true)
+                            )
+                        {
+                            self.tree[node_after_ix].item.body = ItemBody::SoftBreak;
+                        }
+                        // The clamp below can't trim an item that carries its
+                        // own content: a character reference the URL ends
+                        // inside would still emit its decoded value.
+                        if orig_start < cand.end
+                            && matches!(
+                                self.tree[node_after_ix].item.body,
+                                ItemBody::SynthesizeText(..)
+                            )
+                        {
+                            self.tree[node_after_ix].item.body = ItemBody::Text {
+                                backslash_escaped: false,
+                            };
+                        }
+                        self.tree[node_after_ix].item.start = new_start;
+                        // The `\` a flag refers to sits one byte before its
+                        // item, so the link owns it here. A surviving flag
+                        // would stretch the successor's span back over it, and
+                        // on a `<` keep the inline HTML from opening.
+                        if orig_start <= cand.end {
+                            match &mut self.tree[node_after_ix].item.body {
+                                ItemBody::Text { backslash_escaped }
+                                | ItemBody::MaybeHtml(backslash_escaped) => {
+                                    *backslash_escaped = false;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -2665,7 +2758,10 @@ fn scan_nodes_to_ix(
     ix: usize,
 ) -> Option<TreeIndex> {
     while let Some(node_ix) = node {
-        if tree[node_ix].item.end <= ix {
+        let item = tree[node_ix].item;
+        // A zero-width node *at* `ix` must not be skipped: callers splice the
+        // result back in as the tail, so skipping drops it from the tree.
+        if item.end <= ix && item.start < ix {
             node = tree[node_ix].next;
         } else {
             break;
@@ -2771,6 +2867,10 @@ struct LinkStack {
 }
 
 impl LinkStack {
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     fn push(&mut self, el: LinkStackEl) {
         self.inner.push(el);
     }
@@ -2914,6 +3014,20 @@ pub(crate) struct JsxElementIndex(usize);
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct DirectiveIndex(usize);
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct AutolinkCandidateIndex(usize);
+
+/// A GFM autolink literal the first pass found but did not commit to. The
+/// `Link` is allocated up front so firing is only a body swap.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct AutolinkCandidate {
+    /// Precedes the trigger byte when the email scan walks back over the local
+    /// part.
+    pub start: usize,
+    pub end: usize,
+    pub link: LinkIndex,
+}
+
 /// A parsed JSX attribute.
 #[cfg(feature = "mdx")]
 #[derive(Debug, Clone)]
@@ -2997,6 +3111,7 @@ pub(crate) struct Allocations<'a> {
     #[cfg(feature = "mdx")]
     jsx_elements: Vec<JsxElementData<'a>>,
     directives: Vec<DirectiveAttrData<'a>>,
+    autolink_candidates: Vec<AutolinkCandidate>,
 }
 
 /// Used by the heading attributes extension.
@@ -3057,7 +3172,17 @@ impl<'a> Allocations<'a> {
             #[cfg(feature = "mdx")]
             jsx_elements: Vec::new(),
             directives: Vec::new(),
+            autolink_candidates: Vec::new(),
         }
+    }
+
+    pub fn allocate_autolink_candidate(
+        &mut self,
+        candidate: AutolinkCandidate,
+    ) -> AutolinkCandidateIndex {
+        let ix = self.autolink_candidates.len();
+        self.autolink_candidates.push(candidate);
+        AutolinkCandidateIndex(ix)
     }
 
     pub fn allocate_cow(&mut self, cow: CowStr<'a>) -> CowIndex {
@@ -3164,6 +3289,14 @@ impl<'a> Index<LinkIndex> for Allocations<'a> {
 
     fn index(&self, ix: LinkIndex) -> &Self::Output {
         self.links.index(ix.0)
+    }
+}
+
+impl<'a> Index<AutolinkCandidateIndex> for Allocations<'a> {
+    type Output = AutolinkCandidate;
+
+    fn index(&self, ix: AutolinkCandidateIndex) -> &Self::Output {
+        self.autolink_candidates.index(ix.0)
     }
 }
 
@@ -3444,7 +3577,7 @@ fn item_to_event<'a>(item: Item, text: &'a str, allocs: &mut Allocations<'a>) ->
         ItemBody::MathBlock(cow_ix) => {
             Tag::CodeBlock(CodeBlockKind::Fenced(allocs.take_cow(cow_ix)))
         }
-        ItemBody::FencedCodeBlock(cow_ix) => {
+        ItemBody::FencedCodeBlock(cow_ix, _) => {
             Tag::CodeBlock(CodeBlockKind::Fenced(allocs.take_cow(cow_ix)))
         }
         ItemBody::IndentCodeBlock(..) => Tag::CodeBlock(CodeBlockKind::Indented),

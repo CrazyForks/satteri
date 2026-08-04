@@ -4,6 +4,9 @@
 /// Run with: `cargo bench -p satteri-bench`
 const MARKDOWN: &str = include_str!("../fixtures/markdown.md");
 
+/// Autolink-heavy Markdown; `markdown.md` has no autolink triggers.
+const AUTOLINKS: &str = include_str!("../fixtures/autolinks.md");
+
 /// A short MDX snippet representative of real-world usage.
 const MDX: &str = r#"import {Chart} from './chart.js'
 
@@ -91,12 +94,33 @@ fn parse_no_positions(bencher: divan::Bencher) {
     bencher.bench(|| satteri_pulldown_cmark::parse_no_positions(MARKDOWN, opts));
 }
 
+#[divan::bench]
+fn parse_autolinks(bencher: divan::Bencher) {
+    let opts = satteri_pulldown_cmark::DEFAULT_OPTIONS;
+    bencher.bench(|| satteri_pulldown_cmark::parse(AUTOLINKS, opts));
+}
+
+#[divan::bench]
+fn parse_autolinks_no_positions(bencher: divan::Bencher) {
+    let opts = satteri_pulldown_cmark::DEFAULT_OPTIONS;
+    bencher.bench(|| satteri_pulldown_cmark::parse_no_positions(AUTOLINKS, opts));
+}
+
 /// Full pipeline: Markdown source → Arena → HTML string.
 #[divan::bench]
 fn full_pipeline_to_html(bencher: divan::Bencher) {
     let opts = satteri_pulldown_cmark::DEFAULT_OPTIONS;
     bencher.bench(|| {
         let (arena, _) = satteri_pulldown_cmark::parse(MARKDOWN, opts);
+        satteri_ast::mdast_to_html(&arena)
+    });
+}
+
+#[divan::bench]
+fn full_pipeline_to_html_autolinks(bencher: divan::Bencher) {
+    let opts = satteri_pulldown_cmark::DEFAULT_OPTIONS;
+    bencher.bench(|| {
+        let (arena, _) = satteri_pulldown_cmark::parse(AUTOLINKS, opts);
         satteri_ast::mdast_to_html(&arena)
     });
 }

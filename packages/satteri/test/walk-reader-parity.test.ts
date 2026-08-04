@@ -115,6 +115,22 @@ test("C3: walk-path position matches the reader for every matched node", () => {
   }
 });
 
+test("C3: GFM autolink positions match the reader, present or absent (#187)", () => {
+  // The first doc's autolink carries a position; the unclosed `[` in the second
+  // sends it down the position-less path.
+  const docs = ["[[x]](https://x.y)\n\n[x]: /", "a [b(https://x.y), c"];
+  for (const md of docs) {
+    for (const type of ["link", "text"] as const) {
+      const { walked, materialized } = walkAndReader(md, type);
+      expect(walked.length).toBe(materialized.length);
+      expect(walked.length).toBeGreaterThan(0);
+      for (let i = 0; i < walked.length; i++) {
+        expect(walked[i]!.position).toEqual(materialized[i]!.position);
+      }
+    }
+  }
+});
+
 // C1 — mdast context structural methods preserve passed-through node identity
 
 test("C1: ctx.replaceNode preserves a passed-through child's identity (nested transforms, one pass)", () => {
