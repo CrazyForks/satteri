@@ -786,33 +786,137 @@ describe("MDAST conformance: fuzz regressions", () => {
   });
 });
 
-// CommonMark strips only spaces and tabs from the end of a line, and a BOM is
-// ordinary content; satteri drops all three from the text node's value.
+// Only spaces and tabs make up block structure and line-end padding, so VT and
+// FF are content wherever they appear.
 describe("MDAST conformance: control and format characters at a text-node edge", () => {
-  test.fails("trailing VT ends a paragraph", () => {
+  test("trailing VT ends a paragraph", () => {
     assertMdastConformance("abc\u{b}\n");
+    assertMdastConformance("abc\u{b}\u{b}\n");
+    assertMdastConformance("abc\u{b}\r\n");
   });
 
-  test.fails("trailing FF ends a paragraph", () => {
+  test("trailing FF ends a paragraph", () => {
     assertMdastConformance("abc\u{c}\n");
   });
 
-  test.fails("trailing VT after an inline construct is its own text node", () => {
+  test("trailing VT after an inline construct is its own text node", () => {
     assertMdastConformance("*a*\u{b}\n");
     assertMdastConformance("`c`\u{b}\n");
+    assertMdastConformance("[a](/x)\u{b}\n");
+    assertMdastConformance("<https://a.com>\u{b}\n");
+  });
+
+  test("trailing VT at end of input", () => {
+    assertMdastConformance("abc\u{b}");
+    assertMdastConformance("abc\u{c}");
+  });
+
+  test("VT and FF mid-line are content", () => {
+    assertMdastConformance("a\u{b}b\n");
+    assertMdastConformance("a\u{c}b\n");
+    assertMdastConformance("*a\u{b}*\n");
+  });
+
+  test("only the spaces and tabs around a VT are stripped", () => {
+    assertMdastConformance("abc \u{b} \n");
+    assertMdastConformance("abc\t\u{b}\t\n");
+    // Two trailing spaces after the VT still make a hard break.
+    assertMdastConformance("abc\u{b}  \ndef\n");
+  });
+
+  test("trailing VT ends a soft-broken line", () => {
+    assertMdastConformance("abc\u{b}\ndef\n");
+    assertMdastConformance("a\\\u{b}\nb\n");
+  });
+
+  test("trailing VT inside a container", () => {
+    assertMdastConformance("> q\u{b}\n");
+    assertMdastConformance("- i\u{b}\n");
+    assertMdastConformance("| a |\n| - |\n| x\u{b} |\n");
+    assertMdastConformance("h\u{b}\n===\n");
+  });
+
+  test("VT in a code block is content", () => {
+    assertMdastConformance("```\nx\u{b}\n```\n");
+    assertMdastConformance("    code\u{b}\n");
   });
 
   test.fails("a BOM opening a text node is kept", () => {
     assertMdastConformance("*a*\u{feff}x\n");
     assertMdastConformance("user@example.com\u{feff}\n");
   });
+
+  test("a line of only VT or FF is a paragraph, not a blank line", () => {
+    assertMdastConformance("\u{b}\n");
+    assertMdastConformance("\u{c}\n");
+    assertMdastConformance("  \u{b}  \n");
+    assertMdastConformance("a\n\u{b}\nb\n");
+    assertMdastConformance("- a\n\u{b}\n- b\n");
+    assertMdastConformance("```\na\n\u{b}\nb\n```\n");
+  });
+
+  test("a VT after a definition destination makes it a paragraph", () => {
+    assertMdastConformance("[a]: /x\u{b}\n\n[a]\n");
+    assertMdastConformance('[a]: /x "t"\u{b}\n\n[a]\n');
+  });
+
+  test("a VT does not stand in for the space a block marker needs", () => {
+    assertMdastConformance("-\u{b}a\n");
+    assertMdastConformance(">\u{b}a\n");
+    assertMdastConformance("- [\u{b}] a\n");
+    assertMdastConformance("```js\u{b}x\n```\n");
+  });
+
+  test("a VT does not open an ATX heading", () => {
+    assertMdastConformance("#\u{b}h\n");
+    assertMdastConformance("#\u{b}\n");
+    assertMdastConformance("###\u{c}h\n");
+  });
+
+  test("a VT does not close a task list marker", () => {
+    assertMdastConformance("- [ ]\u{b} a\n");
+    assertMdastConformance("- [x]\u{c} a\n");
+  });
+
+  test("a VT in a label is part of the identifier", () => {
+    assertMdastConformance("[\u{b}a]: /x\n\n[a]\n");
+    assertMdastConformance("[a\u{b}]: /x\n\n[a]\n");
+    assertMdastConformance("a[^1\u{b}]\n\n[^1]: n\n");
+    assertMdastConformance("a[^1]\n\n[^1\u{b}]: n\n");
+  });
+
+  test("a VT does not separate HTML attributes", () => {
+    assertMdastConformance('<a href\u{b}="/x">l</a>\n');
+    assertMdastConformance('<a href=\u{b}"/x">l</a>\n');
+  });
 });
 
-describe("MDAST conformance: table cell starting with an escaped pipe", () => {
-  // The cell's text span should cover the raw `\|`; satteri starts it at the
-  // `|`, which is the one place its spans don't cover the escape.
-  test.fails("leading `\\|` in a cell", () => {
+describe("MDAST conformance: table cell with an escaped pipe", () => {
+  test("leading `\\|` in a cell", () => {
     assertMdastConformance("| a |\n| - |\n| \\|abc |\n");
+    assertMdastConformance("| a |\n| - |\n| \\| |\n");
+    assertMdastConformance("| a |\n| - |\n|\\|abc|\n");
+    assertMdastConformance("| \\|h |\n| - |\n| a |\n");
+    assertMdastConformance("| a | b |\n| - | - |\n| x | \\|y |\n");
+  });
+
+  test("consecutive and repeated escaped pipes in a cell", () => {
+    assertMdastConformance("| a |\n| - |\n| \\|\\|a |\n");
+    assertMdastConformance("| a |\n| - |\n| \\|abc\\|d |\n");
+    assertMdastConformance("| a |\n| - |\n| \\|\\*x |\n");
+  });
+
+  test("a leading `\\|` followed by an inline construct", () => {
+    assertMdastConformance("| a |\n| - |\n| \\|*e* |\n");
+    assertMdastConformance("| a |\n| - |\n| \\|`c` |\n");
+  });
+
+  test("a text node that starts on `\\|` after an inline construct", () => {
+    assertMdastConformance("| a |\n| - |\n| *x*\\|z |\n");
+    assertMdastConformance("| a |\n| - |\n| `c`\\|z |\n");
+    assertMdastConformance("| a |\n| - |\n| user@example.com\\|z |\n");
+    assertMdastConformance("| a |\n| - |\n| **b**\\|\\|z |\n");
+    assertMdastConformance("| a |\n| - |\n| [t](u)\\|z |\n");
   });
 
   test("an escape that is neither leading nor a pipe is unaffected", () => {
