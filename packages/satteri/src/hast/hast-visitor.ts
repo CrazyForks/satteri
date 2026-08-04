@@ -69,6 +69,8 @@ import {
   makeRequireNid,
   mergeAndReset,
   type PluginOptions,
+  ROOT_NODE_ID,
+  requireRootReplacement,
   unencodableContentError,
 } from "../visitor-shared.js";
 import {
@@ -138,6 +140,8 @@ export interface HastVisitorContext {
   /**
    * Swap `node` for one node, or for an array of nodes placed in order at its
    * position. An empty array drops the node, the same as `removeNode`.
+   * The document root takes a `root` and nothing else — the one place a
+   * `root` is accepted as content.
    */
   replaceNode(node: Readonly<HastNode>, newNode: HastContent | HastContent[]): void;
   insertBefore(node: Readonly<HastNode>, newNode: HastContent | HastContent[]): void;
@@ -275,6 +279,25 @@ function emitHastTree(buffer: CommandBuffer, op: StructuralOp, id: number, node:
   if (!ok) throw unencodableContentError(node);
 }
 
+/** Separate from the per-node encoder, which rejects a `root` payload. */
+function emitHastRootReplace(buffer: CommandBuffer, root: HastContent): void {
+  const ok = buffer.emitOpstreamCommand(STRUCTURAL_CMD.replace, ROOT_NODE_ID, () =>
+    emitHastRootOp(buffer, root as unknown as Record<string, unknown>),
+  );
+  if (!ok) throw unencodableContentError(root);
+}
+
+function emitHastRootOp(w: OpWriter, n: Record<string, unknown>): boolean {
+  w.open(HAST_ROOT);
+  if (n.data != null) w.data(n.data);
+  const children = n.children;
+  if (Array.isArray(children)) {
+    for (const c of children) if (!emitHastOp(w, c, false)) return false;
+  }
+  w.close();
+  return true;
+}
+
 function emitHastOp(w: OpWriter, node: unknown, isRoot: boolean): boolean {
   if (node === null || typeof node !== "object") return false;
   if (!isRoot) {
@@ -383,11 +406,17 @@ class HastVisitorContextImpl implements HastVisitorContext {
       if (previous === undefined) {
         // Replacing with nothing drops the node, like removeNode.
         this.removeNode(node);
+      } else if (id === ROOT_NODE_ID) {
+        emitHastRootReplace(this.#commandBuffer, requireRootReplacement(previous));
       } else {
         emitHastTree(this.#commandBuffer, "replace", id, previous);
       }
       // A stale queued replacement would win: setProperty folds into it, landing last.
       this.#pendingNodes.delete(id);
+      return;
+    }
+    if (id === ROOT_NODE_ID) {
+      emitHastRootReplace(this.#commandBuffer, requireRootReplacement(newNode));
       return;
     }
     emitHastTree(this.#commandBuffer, "replace", id, newNode);
@@ -556,9 +585,17 @@ type HastVisitorFn<N extends HastNode = HastNode> = (
   ctx: HastVisitorContext,
 ) => HastNode | void | Promise<HastNode | void>;
 
+type HastHookFn = (root: Readonly<HastRoot>, ctx: HastVisitorContext) => void | Promise<void>;
+
 export interface HastVisitorInstance {
   /** Plugin-level configuration (e.g. `{ position: true }` to read positions). */
   options?: PluginOptions;
+  /** Runs once per document — an empty one included — before the plugin's
+   *  visitors, awaited when async. */
+  before?: HastHookFn;
+  /** Runs once per document — an empty one included — after the plugin's
+   *  visitors have settled, awaited when async. */
+  after?: HastHookFn;
   // Element-like nodes: filtered by tag/component name (single or array)
   element?: HastFilteredVisitor<Element> | HastFilteredVisitor<Element>[];
   mdxJsxFlowElement?:
@@ -640,6 +677,14 @@ function buildSubscriptions(plugin: HastVisitorInstance): CachedSubs {
   }
 
   const rustSubs = subs.map((s) => ({ nodeType: s.nodeType, tagFilter: s.tagFilter }));
+  if (typeof plugin.before === "function" || typeof plugin.after === "function") {
+    // Node 0 always exists, so subscribing by type fires exactly once per
+    // document. Dispatch also assumes this is the only root subscription.
+    if (process.env.NODE_ENV !== "production" && subs.some((s) => s.nodeType === HAST_ROOT)) {
+      throw new Error("satteri: `root` is subscribable, which breaks plugin hook dispatch");
+    }
+    rustSubs.push({ nodeType: HAST_ROOT, tagFilter: [] });
+  }
   return { subs, rustSubs };
 }
 
@@ -1009,10 +1054,18 @@ function readMatchedNode(
       data,
     );
   }
-  // Fallback (e.g. doctype): minimal node carrying whatever prelude data we found
+  // Fallback: root and doctype.
   const base: Record<string, unknown> = { type: TYPE_NAMES[nodeType] ?? `unknown(${nodeType})` };
   if (position !== undefined) base.position = position;
   if (data !== null) base.data = data;
+  if (nodeType === HAST_ROOT) {
+    // `...root.children` has to work in a hook, empty document included.
+    if (childCount > 0) {
+      makeLazyChildren(base, view, buf, childIdsPos, childTypesPos, childCount, resolver);
+    } else {
+      base.children = [];
+    }
+  }
   const node = base as unknown as HastNode;
   nodeIdMap.set(node, nodeId);
   return node;
@@ -1118,25 +1171,21 @@ function isTextValueSwap(result: HastNode, original: HastNode): boolean {
   );
 }
 
-/**
- * Dispatch matched nodes from a binary match buffer to visitor functions.
- * Returns null if all sync, or an array of deferred promises if any visitor was async.
- */
+/** Returns null if every visitor was sync, else the ones still pending. */
 function dispatchMatches(
-  matchBuf: Uint8Array,
+  wire: WalkWire,
+  matchCount: number,
+  startIndex: number,
   subs: ResolvedSubscription[],
   ctx: HastVisitorContextImpl,
   returnBuffer: CommandBuffer,
-  resolver: HastLazyChildResolver,
 ): { nodeId: number; promise: Promise<HastNode | void>; originalNode: HastNode }[] | null {
-  const matchView = new DataView(matchBuf.buffer, matchBuf.byteOffset, matchBuf.byteLength);
-  const matchCount = matchView.getUint32(0, true);
-  const wire: WalkWire = { view: matchView, buf: matchBuf, resolver };
+  const { view: matchView, buf: matchBuf } = wire;
   let deferred:
     | { nodeId: number; promise: Promise<HastNode | void>; originalNode: HastNode }[]
     | null = null;
 
-  for (let i = 0; i < matchCount; i++) {
+  for (let i = startIndex; i < matchCount; i++) {
     const indexBase = 4 + i * 10;
     const nodeId = matchView.getUint32(indexBase, true);
     const subIndex = matchBuf[indexBase + 4]!;
@@ -1203,24 +1252,89 @@ export function visitHastHandleCollect(
   const ctx = new HastVisitorContextImpl(handle, getSource, fileURL, resolver, data, sourceFormat);
   const returnBuffer = acquireCommandBuffer();
   const rustSubs = getRustSubs(plugin);
-  const deferred = dispatchMatches(walkHandle(handle, rustSubs), subs, ctx, returnBuffer, resolver);
+  const matchBuf = walkHandle(handle, rustSubs);
+  const matchView = new DataView(matchBuf.buffer, matchBuf.byteOffset, matchBuf.byteLength);
+  const matchCount = matchView.getUint32(0, true);
+  const wire: WalkWire = { view: matchView, buf: matchBuf, resolver };
+
+  // `root` is not a subscribable visitor key, so a sub index past the
+  // visitors can only be the hook subscription — and pre-order puts it first.
+  if (matchCount > 0 && matchBuf[8] === subs.length) {
+    return visitHastHandleWithHooks(plugin, subs, ctx, returnBuffer, wire, matchCount);
+  }
+
+  const deferred = dispatchMatches(wire, matchCount, 0, subs, ctx, returnBuffer);
 
   if (deferred) {
-    return Promise.all(
-      deferred.map((d) =>
-        d.promise.then((result) => ({ nodeId: d.nodeId, result, originalNode: d.originalNode })),
-      ),
-    ).then((results) => {
-      for (const { nodeId, result, originalNode } of results) {
-        if (result != null && result !== originalNode) {
-          emitHastTree(returnBuffer, "replace", nodeId, result);
-        }
-      }
-      return collectCommands(returnBuffer, ctx);
-    });
+    return applyDeferredHastResults(deferred, returnBuffer).then(() =>
+      collectCommands(returnBuffer, ctx),
+    );
   }
 
   return collectCommands(returnBuffer, ctx);
+}
+
+function applyDeferredHastResults(
+  deferred: { nodeId: number; promise: Promise<HastNode | void>; originalNode: HastNode }[],
+  returnBuffer: CommandBuffer,
+): Promise<void> {
+  return Promise.all(
+    deferred.map((d) =>
+      d.promise.then((result) => ({ nodeId: d.nodeId, result, originalNode: d.originalNode })),
+    ),
+  ).then((results) => {
+    for (const { nodeId, result, originalNode } of results) {
+      if (result != null && result !== originalNode) {
+        emitHastTree(returnBuffer, "replace", nodeId, result);
+      }
+    }
+  });
+}
+
+/** Match 0 must be the hook root — the caller checks it, this does not. */
+function visitHastHandleWithHooks(
+  plugin: HastVisitorInstance,
+  subs: ResolvedSubscription[],
+  ctx: HastVisitorContextImpl,
+  returnBuffer: CommandBuffer,
+  wire: WalkWire,
+  matchCount: number,
+): Uint8Array | Promise<Uint8Array> {
+  const { view: matchView } = wire;
+  const hookRoot = readMatchedNode(
+    wire,
+    matchView.getUint32(10, true),
+    matchView.getUint32(4, true),
+    HAST_ROOT,
+  ) as HastRoot;
+
+  const dispatchAndCollect = (): Uint8Array | Promise<Uint8Array> => {
+    const deferred = dispatchMatches(wire, matchCount, 1, subs, ctx, returnBuffer);
+
+    const runAfterAndCollect = (): Uint8Array | Promise<Uint8Array> => {
+      const afterFn = plugin.after;
+      if (typeof afterFn === "function") {
+        const result = afterFn(hookRoot, ctx);
+        if (result instanceof Promise) {
+          return result.then(() => collectCommands(returnBuffer, ctx));
+        }
+      }
+      return collectCommands(returnBuffer, ctx);
+    };
+
+    if (deferred) {
+      return applyDeferredHastResults(deferred, returnBuffer).then(runAfterAndCollect);
+    }
+
+    return runAfterAndCollect();
+  };
+
+  const beforeFn = plugin.before;
+  if (typeof beforeFn === "function") {
+    const result = beforeFn(hookRoot, ctx);
+    if (result instanceof Promise) return result.then(dispatchAndCollect);
+  }
+  return dispatchAndCollect();
 }
 
 function collectCommands(returnBuffer: CommandBuffer, ctx: HastVisitorContextImpl): Uint8Array {
