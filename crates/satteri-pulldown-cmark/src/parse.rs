@@ -62,6 +62,11 @@ pub(crate) enum ItemBody {
 
     // repeats, can_open, can_close
     MaybeEmphasis(usize, bool, bool),
+    /// Head of a run the first pass's escape handler would have swallowed,
+    /// sitting on the byte after a deferred autolink candidate's last. Carries
+    /// the flags for the run the link firing creates; blocked until it does.
+    // repeats, can_open, can_close
+    MaybeEmphasisEscaped(usize, bool, bool),
     // preceded_by_backslash, brace context
     MaybeMath(bool, u8),
     // quote byte, can_open, can_close
@@ -170,6 +175,7 @@ impl ItemBody {
         matches!(
             *self,
             MaybeEmphasis(..)
+                | MaybeEmphasisEscaped(..)
                 | MaybeMath(..)
                 | MaybeSmartQuote(..)
                 | MaybeCode(..)
@@ -188,6 +194,7 @@ impl ItemBody {
         matches!(
             *self,
             MaybeEmphasis(..)
+                | MaybeEmphasisEscaped(..)
                 | MaybeMath(..)
                 | MaybeSmartQuote(..)
                 | MaybeCode(..)
@@ -1241,6 +1248,25 @@ impl<'input> ParserInner<'input> {
                                 _ => {}
                             }
                         }
+                        self.repair_construct_after_url_end(cand.end, node_after_ix);
+                    }
+                }
+                ItemBody::MaybeEmphasisEscaped(count, ..) => {
+                    // Nothing unblocked it, so the escape stands: the delimiter
+                    // it hid is literal and the run after it is one shorter.
+                    self.tree[cur_ix].item.body = ItemBody::Text {
+                        backslash_escaped: true,
+                    };
+                    let c = self.text.as_bytes()[self.tree[cur_ix].item.start];
+                    if !crate::firstpass::delim_run_is_valid(c, count - 1, self.options) {
+                        let mut scan = self.tree[cur_ix].next;
+                        for _ in 1..count {
+                            let Some(next_ix) = scan else { break };
+                            self.tree[next_ix].item.body = ItemBody::Text {
+                                backslash_escaped: false,
+                            };
+                            scan = self.tree[next_ix].next;
+                        }
                     }
                 }
                 ItemBody::MaybeLinkOpen => {
@@ -1425,7 +1451,28 @@ impl<'input> ParserInner<'input> {
                                     };
                                     self.tree[reference_close_node].item.body =
                                         ItemBody::MaybeLinkClose(false);
-                                    let next_node = self.tree[reference_close_node].next;
+                                    // The label scan walks raw source, so it can
+                                    // stop inside a wider item, e.g. an MDX
+                                    // expression or directive holding a `]`. The
+                                    // label owns up to `end_ix`; the rest is
+                                    // literal text, and without this it would
+                                    // belong to no node.
+                                    let close_end = self.tree[reference_close_node].item.end;
+                                    let next_node = if close_end > end_ix {
+                                        self.tree[reference_close_node].item.end = end_ix;
+                                        let tail = self.tree.create_node(Item {
+                                            start: end_ix,
+                                            end: close_end,
+                                            body: ItemBody::Text {
+                                                backslash_escaped: false,
+                                            },
+                                        });
+                                        self.tree[tail].next = self.tree[reference_close_node].next;
+                                        self.tree[reference_close_node].next = Some(tail);
+                                        Some(tail)
+                                    } else {
+                                        self.tree[reference_close_node].next
+                                    };
 
                                     (next_node, LinkType::Reference)
                                 }
@@ -1567,6 +1614,18 @@ impl<'input> ParserInner<'input> {
                                     }
 
                                     self.tree[tos.node].item.end = end;
+                                    // No `max(orig_start, end)` clamp here,
+                                    // unlike the inline-link splice: the item at
+                                    // `end - 1` either ends the label or was
+                                    // truncated to it, and the zero-width items
+                                    // that could sit at `end` all sit on a URL
+                                    // or email byte, never a `]`.
+                                    debug_assert!(
+                                        node_after_link.is_none_or(|node_after_ix| {
+                                            self.tree[node_after_ix].item.start >= end
+                                        }),
+                                        "reference splice must not overrun its successor",
+                                    );
 
                                     // set up cur so next node will be node_after_link
                                     cur = Some(tos.node);
@@ -1589,6 +1648,57 @@ impl<'input> ParserInner<'input> {
         self.wikilink_stack.clear();
         self.code_delims.clear();
         self.math_delims.clear();
+    }
+
+    /// The construct opening on the byte after a URL-ending `\`. The first
+    /// pass's escape handler consumed that byte, so the construct either never
+    /// got an item or got a blocked one; now that the link owns the `\`, give
+    /// it back.
+    fn repair_construct_after_url_end(&mut self, cand_end: usize, node_ix: TreeIndex) {
+        let item = self.tree[node_ix].item;
+        if item.start != cand_end {
+            return;
+        }
+        if let ItemBody::MaybeEmphasisEscaped(count, can_open, can_close) = item.body {
+            self.tree[node_ix].item.body = ItemBody::MaybeEmphasis(count, can_open, can_close);
+            // The rest of the run was emitted for the shorter run the escape
+            // would have left, so only its flanking needs restating.
+            let mut scan = self.tree[node_ix].next;
+            for _ in 1..count {
+                let Some(next_ix) = scan else { break };
+                if let ItemBody::MaybeEmphasis(_, open, close) = &mut self.tree[next_ix].item.body {
+                    *open = can_open;
+                    *close = can_close;
+                }
+                scan = self.tree[next_ix].next;
+            }
+            return;
+        }
+        if !matches!(item.body, ItemBody::Text { .. })
+            || self.text.as_bytes().get(cand_end) != Some(&b'&')
+        {
+            return;
+        }
+        let (n, Some(value)) = scan_entity(&self.text.as_bytes()[cand_end..]) else {
+            return;
+        };
+        if cand_end + n > item.end {
+            return;
+        }
+        let cow_ix = self.allocs.allocate_cow(value);
+        if cand_end + n < item.end {
+            let tail = self.tree.create_node(Item {
+                start: cand_end + n,
+                end: item.end,
+                body: ItemBody::Text {
+                    backslash_escaped: false,
+                },
+            });
+            self.tree[tail].next = self.tree[node_ix].next;
+            self.tree[node_ix].next = Some(tail);
+        }
+        self.tree[node_ix].item.end = cand_end + n;
+        self.tree[node_ix].item.body = ItemBody::SynthesizeText(cow_ix);
     }
 
     /// Handles a wikilink.

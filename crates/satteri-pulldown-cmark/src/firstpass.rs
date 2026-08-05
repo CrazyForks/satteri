@@ -1811,6 +1811,9 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         // Lowest start a further candidate may take: a committed candidate owns
         // its bytes, a deferred one only rules out a retry at the same start.
         let mut candidate_floor: usize = start;
+        // Ends of deferred candidates still in play. Overlapping candidates are
+        // possible, so this is a set; empty in every line without one.
+        let mut deferred_ends: Vec<usize> = Vec::new();
 
         let (final_ix, brk) = iterate_special_bytes(self.lookup_table, bytes, start, |ix, byte| {
             match byte {
@@ -1982,6 +1985,37 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         begin_text = ix + 1;
                         backslash_escaped = true;
                         LoopInstruction::ContinueAndSkip(0)
+                    } else if let Some((count, fired)) = (deferred_ends.contains(&(ix + 1)))
+                        .then(|| escaped_delim_run(self.text, start, ix, mode, self.options))
+                        .flatten()
+                    {
+                        // A deferred candidate's URL ends on this `\`, so the
+                        // run after it is the link's to unblock. Emitted in the
+                        // shape the link firing wants; `MaybeEmphasisEscaped`
+                        // holds it back until the splice says so.
+                        let blocked = delim_run_flags(
+                            self.text,
+                            start,
+                            ix + 2,
+                            count - 1,
+                            mode,
+                            self.options,
+                        );
+                        self.tree.append(Item {
+                            start: ix + 1,
+                            end: ix + 2,
+                            body: ItemBody::MaybeEmphasisEscaped(count, fired.0, fired.1),
+                        });
+                        for i in 1..count {
+                            self.tree.append(Item {
+                                start: ix + 1 + i,
+                                end: ix + 2 + i,
+                                body: ItemBody::MaybeEmphasis(count - i, blocked.0, blocked.1),
+                            });
+                        }
+                        begin_text = ix + 1 + count;
+                        backslash_escaped = false;
+                        LoopInstruction::ContinueAndSkip(count)
                     } else {
                         begin_text = ix + 1;
                         backslash_escaped = true;
@@ -2407,20 +2441,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         } else if count == 3 {
                             ItemBody::SynthesizeChar('—')
                         } else {
-                            let (ems, ens) = match count % 6 {
-                                0 | 3 => (count / 3, 0),
-                                2 | 4 => (0, count / 2),
-                                1 => (count / 3 - 1, 2),
-                                _ => (count / 3, 1),
-                            };
-                            // – and — are 3 bytes each in utf8
-                            let mut buf = String::with_capacity(3 * (ems + ens));
-                            for _ in 0..ems {
-                                buf.push('—');
-                            }
-                            for _ in 0..ens {
-                                buf.push('–');
-                            }
+                            let buf = crate::post_passes::smart_dash_run(count);
                             ItemBody::SynthesizeText(self.allocs.allocate_cow(buf.into()))
                         };
 
@@ -2484,6 +2505,11 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         let (cand_start, cand_end) = (d.start, d.end);
                         if defer_autolink_decision(bytes, paragraph_floor, ix, self.options) {
                             candidate_floor = cand_start + 1;
+                            // The scan only moves forward, so ends behind it can
+                            // never be probed again; dropping them here keeps the
+                            // probe in the escape arm off a growing list.
+                            deferred_ends.retain(|&e| e > ix);
+                            deferred_ends.push(cand_end);
                             // Leave `begin_text` at the candidate's start: its
                             // bytes stay ordinary text unless the marker fires.
                             self.append_autolink_marker(d, begin_text, backslash_escaped);
@@ -4819,6 +4845,107 @@ struct AutolinkDetection {
     url: String,
 }
 
+/// `(can_open, can_close)` for the run of `run_len` delimiters at `at`.
+fn delim_run_flags(
+    text: &str,
+    start: usize,
+    at: usize,
+    run_len: usize,
+    mode: TableParseMode,
+    options: Options,
+) -> (bool, bool) {
+    if run_len == 0 || at >= text.len() {
+        return (false, false);
+    }
+    let s = &text[start..];
+    let suffix = &text[at..];
+    (
+        delim_run_can_open(s, suffix, run_len, at - start, mode, options),
+        delim_run_can_close(s, suffix, run_len, at - start, mode, options),
+    )
+}
+
+/// A run of `~` only means anything at the lengths its extensions define.
+pub(crate) fn delim_run_is_valid(c: u8, count: usize, options: Options) -> bool {
+    c != b'~'
+        || count == 2
+        || (count == 1
+            && (options.contains(Options::ENABLE_STRIKETHROUGH)
+                || options.contains(Options::ENABLE_SUBSCRIPT)))
+}
+
+/// The delimiter run a `\` at `ix` would swallow, when the byte after it ends
+/// a deferred autolink candidate. `None` when nothing there could open or
+/// close, in which case the escape is left to stand as usual.
+fn escaped_delim_run(
+    text: &str,
+    start: usize,
+    ix: usize,
+    mode: TableParseMode,
+    options: Options,
+) -> Option<(usize, (bool, bool))> {
+    let bytes = text.as_bytes();
+    let c = *bytes.get(ix + 1)?;
+    if !matches!(c, b'*' | b'_' | b'~' | b'^') {
+        return None;
+    }
+    let count = 1 + scan_ch_repeat(&bytes[(ix + 2)..], c);
+    let fired = delim_run_flags(text, start, ix + 1, count, mode, options);
+    if (!fired.0 && !fired.1) || !delim_run_is_valid(c, count, options) {
+        return None;
+    }
+    Some((count, fired))
+}
+
+/// An email literal starting at the same offset as a `www.` literal, which
+/// GFM resolves in the email construct's favour. `www_end` bounds the search to
+/// the www span, which the committed path skips outright and the deferred path
+/// was already rescanning.
+fn detect_email_inside_www(
+    bytes: &[u8],
+    ix: usize,
+    www_end: usize,
+    paragraph_start: usize,
+    begin_text: usize,
+) -> Option<AutolinkDetection> {
+    // `_` is the one atext byte that can precede a www literal, and the
+    // attention arm's own email hook already owns that case.
+    if ix > 0 && bytes[ix - 1] == b'_' {
+        return None;
+    }
+    let at_ix = ix + memchr::memchr(b'@', &bytes[ix..www_end])?;
+    let (email_start, email_end, full_url, retry_needed) =
+        crate::post_passes::scan_email_autolink(bytes, at_ix, true)?;
+    // Opening past the trigger is the `@` hook's; opening before it needs an
+    // atext predecessor, and `_` is the only one a www literal takes.
+    if email_start != ix {
+        return None;
+    }
+    debug_assert!(
+        !retry_needed,
+        "a `/` predecessor would have failed the www literal first"
+    );
+    debug_assert!(
+        email_start >= begin_text && email_start >= paragraph_start,
+        "the trigger is inside the current text run"
+    );
+    Some(AutolinkDetection {
+        start: email_start,
+        end: email_end,
+        link_type: LinkType::Email,
+        url: email_addr(full_url),
+    })
+}
+
+/// `scan_email_autolink` returns `mailto:<addr>`; arena_build's Email-link path
+/// prepends `mailto:` again, so strip it here.
+fn email_addr(full_url: String) -> String {
+    full_url
+        .strip_prefix("mailto:")
+        .map(str::to_owned)
+        .unwrap_or(full_url)
+}
+
 /// Detect a GFM autolink literal at a `h`/`H`/`w`/`W`/`@` trigger. Detection
 /// only — committing or deferring is the caller's call, since it turns on
 /// state this function cannot see.
@@ -4830,18 +4957,17 @@ fn detect_gfm_autolink(
     begin_text: usize,
 ) -> Option<AutolinkDetection> {
     // Cheap reject first: most triggers in prose can't start an autolink.
-    match byte {
-        b'h' | b'H' | b'w' | b'W' => {
-            crate::post_passes::match_autolink_scheme(bytes, ix)?;
-        }
+    let is_www = match byte {
+        b'h' | b'H' | b'w' | b'W' => crate::post_passes::match_autolink_scheme(bytes, ix)?.1,
         b'@' => {
             // Email requires at least one atext char immediately before @.
             if ix == 0 || !is_email_local_char(bytes[ix - 1]) {
                 return None;
             }
+            false
         }
         _ => return None,
-    }
+    };
 
     match byte {
         b'h' | b'H' | b'w' | b'W' => {
@@ -4851,6 +4977,15 @@ fn detect_gfm_autolink(
                 scan_autolink_literal(bytes, ix, ix == paragraph_start)?;
             if fnr_only {
                 return None;
+            }
+            // GFM registers the email construct ahead of www at the same
+            // offset, so an `@` the www span would swallow wins instead.
+            if is_www {
+                if let Some(email) =
+                    detect_email_inside_www(bytes, ix, end, paragraph_start, begin_text)
+                {
+                    return Some(email);
+                }
             }
             Some(AutolinkDetection {
                 start,
@@ -4883,17 +5018,11 @@ fn detect_gfm_autolink(
             {
                 return None;
             }
-            // `scan_email_autolink` returns `mailto:<addr>`; arena_build's
-            // Email-link path will prepend `mailto:` again, so strip here.
-            let email_addr = full_url
-                .strip_prefix("mailto:")
-                .map(str::to_owned)
-                .unwrap_or(full_url);
             Some(AutolinkDetection {
                 start: email_start,
                 end: email_end,
                 link_type: LinkType::Email,
-                url: email_addr,
+                url: email_addr(full_url),
             })
         }
         _ => None,
